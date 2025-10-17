@@ -116,6 +116,8 @@ pub struct SlicedProductSumcheck<F: JoltField> {
     pub pending_r: Option<F::Challenge>,
     // Precomputed t values: t in [2..=degree]
     pub t_vals: Vec<F>,
+    #[cfg(feature = "sumcheck_tile_cache")]
+    pub cache: Option<Vec<DensePolynomial<F>>>,
 }
 
 impl<F: JoltField> SlicedProductSumcheck<F> {
@@ -133,7 +135,14 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
         let base = ProductSumcheck::from_polynomials(polynomials);
         let tile_len = Self::compute_tile_len(base.degree);
         let t_vals: Vec<F> = (2..=base.degree).map(|t| F::from_u64(t as u64)).collect();
-        Self { base, tile_len, pending_r: None, t_vals }
+        Self {
+            base,
+            tile_len,
+            pending_r: None,
+            t_vals,
+            #[cfg(feature = "sumcheck_tile_cache")]
+            cache: None,
+        }
     }
 
     fn compute_once(&mut self) -> Vec<F> {
@@ -159,62 +168,141 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
         let mut evals_at_points = vec![F::zero(); points_len];
 
         if let Some(r) = r_opt {
-            // Compute evals as if arrays were first bound by r (to half size),
-            // but without materializing the bound arrays. Then perform the bind.
-            let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
-                .into_par_iter()
-                .map(|tile_idx| {
-                    let start = tile_idx * self.tile_len;
-                    let end = core::cmp::min(start + self.tile_len, half_before);
-                    // Align to even j so reduced pairs (2k,2k+1) are fully contained
-                    let start_even = start & !1;
-                    let end_even = end & !1;
+            #[cfg(feature = "sumcheck_tile_cache")]
+            {
+                // Ensure cache is allocated for current half size
+                let num_polys = working.len();
+                let mut cache = self
+                    .cache
+                    .take()
+                    .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect());
+                if cache.len() != num_polys {
+                    cache = (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect();
+                }
+                for p in 0..num_polys {
+                    if cache[p].len() != half_before {
+                        cache[p] = DensePolynomial::new(vec![F::zero(); half_before]);
+                    }
+                }
 
-                    // Product eval on reduced pairs within this tile. The reduced array
-                    // y has length half_before with y[j] = a + r*(b-a). We need pairs
-                    // (y[2k], y[2k+1]). We compute them on-the-fly from the original arrays:
-                    // y[2k]   = A0 + r*(B0 - A0) where (A0,B0) = (x[4k], x[4k+1])
-                    // y[2k+1] = A1 + r*(B1 - A1) where (A1,B1) = (x[4k+2], x[4k+3])
-                    let mut tile_h0 = F::zero();
-                    let mut tile_ht = vec![F::zero(); t_vals.len()];
-                    let k_start = start_even / 2;
-                    let k_end = end_even / 2;
-                    // Reusable buffer for prod_t per k
-                    let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
-                    for k in k_start..k_end {
-                        let mut prod_a = F::one();
-                        for poly in working.iter() {
-                            let a00 = poly.Z[4 * k + 0];
-                            let a01 = poly.Z[4 * k + 1];
-                            let a10 = poly.Z[4 * k + 2];
-                            let a11 = poly.Z[4 * k + 3];
-                            let y0 = a00 + r * (a01 - a00);
-                            let y1 = a10 + r * (a11 - a10);
-                            let m2 = y1 - y0;
-                            prod_a = prod_a * y0;
-                            for (idx, &tv) in t_vals.iter().enumerate() {
-                                prod_t[idx] = prod_t[idx] * (y0 + m2 * tv);
+                // Bind phase: per poly, tile the write into cache to improve locality
+                cache
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(p_idx, dst)| {
+                        let src = &working[p_idx];
+                        for tile_idx in 0..num_tiles {
+                            let start = tile_idx * self.tile_len;
+                            let end = core::cmp::min(start + self.tile_len, half_before);
+                            for j in start..end {
+                                let a = src.Z[2 * j];
+                                let b = src.Z[2 * j + 1];
+                                dst.Z[j] = a + r * (b - a);
                             }
                         }
-                        tile_h0 = tile_h0 + prod_a;
-                        for idx in 0..tile_ht.len() { tile_ht[idx] = tile_ht[idx] + prod_t[idx]; }
-                        // reset prod_t to ones for next k
-                        for v in &mut prod_t { *v = F::one(); }
-                    }
-                    (tile_h0, tile_ht)
-                })
-                .collect();
+                    });
 
-            for (h0, ht) in tile_evals.into_iter() {
-                evals_at_points[0] = evals_at_points[0] + h0;
-                for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
+                // Eval phase: read reduced cache arrays and compute h0, ht over pairs
+                let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
+                    .into_par_iter()
+                    .map(|tile_idx| {
+                        let start = tile_idx * self.tile_len;
+                        let end = core::cmp::min(start + self.tile_len, half_before);
+                        let start_even = start & !1;
+                        let end_even = end & !1;
+                        let mut tile_h0 = F::zero();
+                        let mut tile_ht = vec![F::zero(); t_vals.len()];
+                        let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
+                        let k_start = start_even / 2;
+                        let k_end = end_even / 2;
+                        for k in k_start..k_end {
+                            let mut prod_a = F::one();
+                            for poly in cache.iter() {
+                                let a2 = poly.Z[2 * k];
+                                let b2 = poly.Z[2 * k + 1];
+                                let m2 = b2 - a2;
+                                prod_a = prod_a * a2;
+                                for (idx, &tv) in t_vals.iter().enumerate() {
+                                    prod_t[idx] = prod_t[idx] * (a2 + m2 * tv);
+                                }
+                            }
+                            tile_h0 = tile_h0 + prod_a;
+                            for idx in 0..tile_ht.len() { tile_ht[idx] = tile_ht[idx] + prod_t[idx]; }
+                            for v in &mut prod_t { *v = F::one(); }
+                        }
+                        (tile_h0, tile_ht)
+                    })
+                    .collect();
+
+                for (h0, ht) in tile_evals.into_iter() {
+                    evals_at_points[0] = evals_at_points[0] + h0;
+                    for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
+                }
+
+                // Swap in cache for next round and retain the old buffer for reuse
+                core::mem::swap(&mut self.base.polynomials, &mut cache);
+                self.cache = Some(cache);
             }
 
-            // Now bind polynomials in-place for the next round.
-            self.base
-                .polynomials
-                .par_iter_mut()
-                .for_each(|poly| poly.bind_parallel(r, BindingOrder::LowToHigh));
+            #[cfg(not(feature = "sumcheck_tile_cache"))]
+            {
+                // Compute evals as if arrays were first bound by r (to half size),
+                // but without materializing the bound arrays. Then perform the bind.
+                let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
+                    .into_par_iter()
+                    .map(|tile_idx| {
+                        let start = tile_idx * self.tile_len;
+                        let end = core::cmp::min(start + self.tile_len, half_before);
+                        // Align to even j so reduced pairs (2k,2k+1) are fully contained
+                        let start_even = start & !1;
+                        let end_even = end & !1;
+
+                        // Product eval on reduced pairs within this tile. The reduced array
+                        // y has length half_before with y[j] = a + r*(b-a). We need pairs
+                        // (y[2k], y[2k+1]). We compute them on-the-fly from the original arrays:
+                        // y[2k]   = A0 + r*(B0 - A0) where (A0,B0) = (x[4k], x[4k+1])
+                        // y[2k+1] = A1 + r*(B1 - A1) where (A1,B1) = (x[4k+2], x[4k+3])
+                        let mut tile_h0 = F::zero();
+                        let mut tile_ht = vec![F::zero(); t_vals.len()];
+                        let k_start = start_even / 2;
+                        let k_end = end_even / 2;
+                        // Reusable buffer for prod_t per k
+                        let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
+                        for k in k_start..k_end {
+                            let mut prod_a = F::one();
+                            for poly in working.iter() {
+                                let a00 = poly.Z[4 * k + 0];
+                                let a01 = poly.Z[4 * k + 1];
+                                let a10 = poly.Z[4 * k + 2];
+                                let a11 = poly.Z[4 * k + 3];
+                                let y0 = a00 + r * (a01 - a00);
+                                let y1 = a10 + r * (a11 - a10);
+                                let m2 = y1 - y0;
+                                prod_a = prod_a * y0;
+                                for (idx, &tv) in t_vals.iter().enumerate() {
+                                    prod_t[idx] = prod_t[idx] * (y0 + m2 * tv);
+                                }
+                            }
+                            tile_h0 = tile_h0 + prod_a;
+                            for idx in 0..tile_ht.len() { tile_ht[idx] = tile_ht[idx] + prod_t[idx]; }
+                            // reset prod_t to ones for next k
+                            for v in &mut prod_t { *v = F::one(); }
+                        }
+                        (tile_h0, tile_ht)
+                    })
+                    .collect();
+
+                for (h0, ht) in tile_evals.into_iter() {
+                    evals_at_points[0] = evals_at_points[0] + h0;
+                    for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
+                }
+
+                // Now bind polynomials in-place for the next round.
+                self.base
+                    .polynomials
+                    .par_iter_mut()
+                    .for_each(|poly| poly.bind_parallel(r, BindingOrder::LowToHigh));
+            }
         } else {
             // Round 0: evaluate directly from current (unbound) arrays using full-size pairs
             let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
