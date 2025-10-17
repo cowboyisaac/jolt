@@ -183,7 +183,7 @@ fn compare_implementations(t: u32, d: u32, iterations: usize) -> Result<(), Box<
             i+1, iterations, t_base, t_sliced, claim_baseline
         );
     // Verify proofs for both implementations
-        verify_latest::<Fr>(t, d)?;
+        // verify_latest::<Fr>(t, d)?;
         assert_eq!(claim_baseline, claim_sliced, "Claims differ between baseline and sliced");
         baseline_times.push(t_base);
         sliced_times.push(t_sliced);

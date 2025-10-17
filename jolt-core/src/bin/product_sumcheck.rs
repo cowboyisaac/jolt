@@ -323,9 +323,9 @@ mod tests {
 
     #[test]
     fn sliced_product_sumcheck_t10_d2() {
-        run_product_sumcheck_test(2);
-        run_product_sumcheck_test(3);
-        run_product_sumcheck_test(4);
+        run_slice_product_sumcheck_test(2);
+        run_slice_product_sumcheck_test(3);
+        run_slice_product_sumcheck_test(4);
     }
 
 }
