@@ -28,9 +28,9 @@ struct Cli {
 enum Commands {
     /// Run sumcheck experiments with different configurations
     Run {
-        /// Size of the sumcheck (2^k)
-        #[arg(short, long, default_value = "10")]
-        k: u32,
+        /// Size of the sumcheck (2^T)
+        #[arg(short = 'T', long = "T", default_value = "10")]
+        t: u32,
         
         /// Degree of the polynomial
         #[arg(short, long, default_value = "2")]
@@ -50,9 +50,9 @@ enum Commands {
     },
     /// Compare different sumcheck implementations
     Compare {
-        /// Size of the sumcheck (2^k)
-        #[arg(short, long, default_value = "10")]
-        k: u32,
+        /// Size of the sumcheck (2^T)
+        #[arg(short = 'T', long = "T", default_value = "10")]
+        t: u32,
         
         /// Degree of the polynomial
         #[arg(short, long, default_value = "2")]
@@ -66,11 +66,11 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         threads: usize,
     },
-    /// Batch compare across grids of k, d, threads
+    /// Batch compare across grids of T, d, threads
     Batch {
-        /// Sizes (2^k). Comma-separated list, e.g. 15,20,24
-        #[arg(long = "k", value_delimiter = ',', required = true)]
-        k_list: Vec<u32>,
+        /// Sizes (2^T). Comma-separated list, e.g. 15,20,24
+        #[arg(long = "T", value_delimiter = ',', required = true)]
+        t_list: Vec<u32>,
         /// Degrees d. Comma-separated list, e.g. 2,3,4
         #[arg(long = "d", value_delimiter = ',', required = true)]
         d_list: Vec<u32>,
@@ -88,29 +88,29 @@ fn main() {
     
     match cli.command {
         Commands::Run {
-            k,
+            t,
             d,
             mode,
             iterations,
             threads,
         } => {
             setup_threading(threads);
-            run_single_experiment(k, d, mode, iterations);
+            run_single_experiment(t, d, mode, iterations);
         }
         Commands::Compare {
-            k,
+            t,
             d,
             iterations,
             threads,
         } => {
             setup_threading(threads);
-            match compare_implementations(k, d, iterations) {
+            match compare_implementations(t, d, iterations) {
                 Ok(()) => println!("\nCompare finished successfully."),
                 Err(e) => eprintln!("\nCompare failed: {}", e),
             }
         }
-        Commands::Batch { k_list, d_list, threads_list, iterations } => {
-            run_batch_experiments(k_list, d_list, threads_list, iterations);
+        Commands::Batch { t_list, d_list, threads_list, iterations } => {
+            run_batch_experiments(t_list, d_list, threads_list, iterations);
         }
     }
 }
@@ -128,8 +128,8 @@ fn setup_threading(threads: usize) {
     }
 }
 
-fn run_single_experiment(k: u32, d: u32, mode: u32, iterations: usize) {
-    println!("Running sumcheck experiment: k={}, d={}, mode={}, iterations={}", k, d, mode, iterations);
+fn run_single_experiment(t: u32, d: u32, mode: u32, iterations: usize) {
+    println!("Running sumcheck experiment: T={}, d={}, mode={}, iterations={}", t, d, mode, iterations);
     
     let mut times = Vec::new();
     let mut success = true;
@@ -142,10 +142,10 @@ fn run_single_experiment(k: u32, d: u32, mode: u32, iterations: usize) {
         // Only profile the proving time, not verification
         let start = Instant::now();
         let result = match mode {
-            0 => run_baseline_sumcheck::<Fr>(k, d, threads),
+            0 => run_baseline_sumcheck::<Fr>(t, d, threads),
             _ => {
                 println!("Unknown mode {}, falling back to mode 0", mode);
-                run_baseline_sumcheck::<Fr>(k, d, threads)
+                run_baseline_sumcheck::<Fr>(t, d, threads)
             }
         };
         let duration = start.elapsed();
@@ -177,7 +177,7 @@ fn run_single_experiment(k: u32, d: u32, mode: u32, iterations: usize) {
             _ => "Unknown",
         };
         println!("  Mode: {} ({})", mode, mode_name);
-        println!("  Size: 2^{} = {}", k, 1 << k);
+        println!("  Size: 2^{} = {}", t, 1 << t);
         println!("  Degree: {}", d);
         println!("  Iterations: {}", times.len());
         println!("  Total time: {:.2}ms", total_time);
@@ -188,22 +188,22 @@ fn run_single_experiment(k: u32, d: u32, mode: u32, iterations: usize) {
     }
 }
 
-fn compare_implementations(k: u32, d: u32, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Comparing sumcheck implementations: k={}, d={}, iterations={}", k, d, iterations);
+fn compare_implementations(t: u32, d: u32, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Comparing sumcheck implementations: T={}, d={}, iterations={}", t, d, iterations);
     let threads = rayon::current_num_threads();
 
     let mut baseline_times = Vec::new();
     let mut sliced_times = Vec::new();
 
     for i in 0..iterations {
-    let (polys, claim_baseline, t_base) = timed_baseline::<Fr>(k, d, threads);
+    let (polys, claim_baseline, t_base) = timed_baseline::<Fr>(t, d, threads);
     let (claim_sliced, t_sliced) = timed_sliced_with_polys::<Fr>(polys, threads);
         println!(
             "  Iteration {:>2}/{}: baseline={:.2}ms, sliced={:.2}ms, claim={}",
             i+1, iterations, t_base, t_sliced, claim_baseline
         );
     // Verify proofs for both implementations
-        verify_latest::<Fr>(k, d, threads)?;
+        verify_latest::<Fr>(t, d, threads)?;
         assert_eq!(claim_baseline, claim_sliced, "Claims differ between baseline and sliced");
         baseline_times.push(t_base);
         sliced_times.push(t_sliced);
@@ -222,21 +222,21 @@ fn compare_implementations(k: u32, d: u32, iterations: usize) -> Result<(), Box<
     let (s_avg,s_med,s_min,s_max) = stats(&sliced_times);
 
     println!("\nThreads: configured={}, rayon_current={}", threads, rayon::current_num_threads());
-    println!("Problem: n=2^{}, degree={} polys", k, d);
+    println!("Problem: n=2^{}, degree={} polys", t, d);
     println!("Baseline: avg={:.2}ms, med={:.2}ms, min={:.2}ms, max={:.2}ms", b_avg,b_med,b_min,b_max);
     println!("Sliced:   avg={:.2}ms, med={:.2}ms, min={:.2}ms, max={:.2}ms", s_avg,s_med,s_min,s_max);
     if s_avg>0.0 { println!("Speedup (Baseline/Sliced): {:.2}x", b_avg/s_avg); }
     Ok(())
 }
 
-fn run_batch_experiments(k_list: Vec<u32>, d_list: Vec<u32>, threads_list: Vec<usize>, iterations: usize) {
-    println!("Batch experiments: ks={:?}, ds={:?}, threads={:?}, iterations={}", k_list, d_list, threads_list, iterations);
-    for &k in &k_list {
+fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, threads_list: Vec<usize>, iterations: usize) {
+    println!("Batch experiments: Ts={:?}, ds={:?}, threads={:?}, iterations={}", t_list, d_list, threads_list, iterations);
+    for &t in &t_list {
         for &d in &d_list {
-            for &t in &threads_list {
-                if t > 0 { let _ = rayon::ThreadPoolBuilder::new().num_threads(t).build_global(); }
-                println!("\n== Case: k={}, d={}, threads={} ==", k, d, if t==0 { rayon::current_num_threads() } else { t });
-                if let Err(e) = compare_implementations(k, d, iterations) {
+            for &threads in &threads_list {
+                if threads > 0 { let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global(); }
+                println!("\n== Case: T={}, d={}, threads={} ==", t, d, if threads==0 { rayon::current_num_threads() } else { threads });
+                if let Err(e) = compare_implementations(t, d, iterations) {
                     println!("  ERROR: {}", e);
                 }
             }
@@ -246,8 +246,8 @@ fn run_batch_experiments(k_list: Vec<u32>, d_list: Vec<u32>, threads_list: Vec<u
 
 // ------------ Helpers moved from impl -------------
 
-fn build_random_dense_polys<F: JoltField>(k: u32, d: u32, seed: &str) -> Vec<DensePolynomial<F>> {
-    let n = 1 << k;
+fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<DensePolynomial<F>> {
+    let n = 1 << t;
     let degree = d as usize;
     let mut polynomials = Vec::with_capacity(degree);
     for poly_idx in 0..degree {
@@ -260,8 +260,8 @@ fn build_random_dense_polys<F: JoltField>(k: u32, d: u32, seed: &str) -> Vec<Den
     polynomials
 }
 
-fn run_baseline_sumcheck<F: JoltField>(k: u32, d: u32, threads: usize) -> Result<F, Box<dyn std::error::Error>> {
-    let polys = build_random_dense_polys::<F>(k, d, "fun");
+fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32, threads: usize) -> Result<F, Box<dyn std::error::Error>> {
+    let polys = build_random_dense_polys::<F>(t, d, "fun");
     let mut sumcheck = ProductSumcheck::from_polynomials(polys, threads);
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_proof, _chals) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
@@ -272,8 +272,8 @@ fn run_baseline_sumcheck<F: JoltField>(k: u32, d: u32, threads: usize) -> Result
     Ok(<ProductSumcheck<F> as SumcheckInstance<F, Blake2bTranscript>>::input_claim(&sumcheck))
 }
 
-fn timed_baseline<F: JoltField>(k: u32, d: u32, threads: usize) -> (Vec<DensePolynomial<F>>, F, f64) {
-    let polys = build_random_dense_polys::<F>(k, d, "fun");
+fn timed_baseline<F: JoltField>(t: u32, d: u32, threads: usize) -> (Vec<DensePolynomial<F>>, F, f64) {
+    let polys = build_random_dense_polys::<F>(t, d, "fun");
     let mut sumcheck = ProductSumcheck::from_polynomials(polys.clone(), threads);
     let start = Instant::now();
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
@@ -291,8 +291,8 @@ fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, threads
     (sumcheck.base.input_claim, elapsed)
 }
 
-fn verify_latest<F: JoltField>(k: u32, d: u32, threads: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let polys = build_random_dense_polys::<F>(k, d, "fun");
+fn verify_latest<F: JoltField>(t: u32, d: u32, threads: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let polys = build_random_dense_polys::<F>(t, d, "fun");
     // Baseline
     let mut base = ProductSumcheck::from_polynomials(polys.clone(), threads);
     let mut t1 = Blake2bTranscript::new(b"sumcheck_experiment");
