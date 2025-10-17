@@ -114,6 +114,8 @@ pub struct SlicedProductSumcheck<F: JoltField> {
     pub base: ProductSumcheck<F>,
     pub tile_len: usize,
     pub pending_r: Option<F::Challenge>,
+    // Precomputed t values: t in [2..=degree]
+    pub t_vals: Vec<F>,
 }
 
 impl<F: JoltField> SlicedProductSumcheck<F> {
@@ -130,7 +132,8 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
     pub fn from_polynomials(polynomials: Vec<DensePolynomial<F>>) -> Self {
         let base = ProductSumcheck::from_polynomials(polynomials);
         let tile_len = Self::compute_tile_len(base.degree);
-        Self { base, tile_len, pending_r: None }
+        let t_vals: Vec<F> = (2..=base.degree).map(|t| F::from_u64(t as u64)).collect();
+        Self { base, tile_len, pending_r: None, t_vals }
     }
 
     fn compute_once(&mut self) -> Vec<F> {
@@ -139,7 +142,7 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
         // Two modes:
         // - If binding pending (round > 0): per-tile bind-then-evaluate using the freshly bound cache
         // - If no binding (round 0): evaluate directly from current polynomials
-        let working: Vec<&DensePolynomial<F>> = self.base.polynomials.iter().collect();
+        let working: &[DensePolynomial<F>] = &self.base.polynomials;
         let len_before = working[0].len();
         for (i, poly) in working.iter().enumerate() {
             assert_eq!(poly.len(), len_before, "Polynomial {} has length {}, expected {}", i, poly.len(), len_before);
@@ -147,7 +150,7 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
         let half_before = len_before / 2;
         let degree = self.base.degree;
         let points_len = 1 + (degree.saturating_sub(1));
-        let t_vals: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
+        let t_vals = &self.t_vals;
         if half_before == 0 { return vec![F::zero(); points_len]; }
 
         let num_tiles = (half_before + self.tile_len - 1) / self.tile_len;
@@ -163,6 +166,9 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
                 .map(|tile_idx| {
                     let start = tile_idx * self.tile_len;
                     let end = core::cmp::min(start + self.tile_len, half_before);
+                    // Align to even j so reduced pairs (2k,2k+1) are fully contained
+                    let start_even = start & !1;
+                    let end_even = end & !1;
 
                     // Product eval on reduced pairs within this tile. The reduced array
                     // y has length half_before with y[j] = a + r*(b-a). We need pairs
@@ -171,11 +177,12 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
                     // y[2k+1] = A1 + r*(B1 - A1) where (A1,B1) = (x[4k+2], x[4k+3])
                     let mut tile_h0 = F::zero();
                     let mut tile_ht = vec![F::zero(); t_vals.len()];
-                    let k_start = start / 2;
-                    let k_end = end / 2;
+                    let k_start = start_even / 2;
+                    let k_end = end_even / 2;
+                    // Reusable buffer for prod_t per k
+                    let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
                     for k in k_start..k_end {
                         let mut prod_a = F::one();
-                        let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
                         for poly in working.iter() {
                             let a00 = poly.Z[4 * k + 0];
                             let a01 = poly.Z[4 * k + 1];
@@ -191,6 +198,8 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
                         }
                         tile_h0 = tile_h0 + prod_a;
                         for idx in 0..tile_ht.len() { tile_ht[idx] = tile_ht[idx] + prod_t[idx]; }
+                        // reset prod_t to ones for next k
+                        for v in &mut prod_t { *v = F::one(); }
                     }
                     (tile_h0, tile_ht)
                 })
@@ -215,9 +224,10 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
                     let end = core::cmp::min(start + self.tile_len, half_before);
                     let mut tile_h0 = F::zero();
                     let mut tile_ht = vec![F::zero(); t_vals.len()];
+                    // Reusable buffer for prod_t per j
+                    let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
                     for j in start..end {
                         let mut prod_a = F::one();
-                        let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
                         for poly in working.iter() {
                             let a = poly.Z[2 * j];
                             let b = poly.Z[2 * j + 1];
@@ -229,6 +239,8 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
                         }
                         tile_h0 = tile_h0 + prod_a;
                         for idx in 0..tile_ht.len() { tile_ht[idx] = tile_ht[idx] + prod_t[idx]; }
+                        // reset prod_t to ones for next j
+                        for v in &mut prod_t { *v = F::one(); }
                     }
                     (tile_h0, tile_ht)
                 })
