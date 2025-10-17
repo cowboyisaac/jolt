@@ -3,13 +3,12 @@ use ark_bn254::Fr;
 use std::time::Instant;
 
 mod product_sumcheck;
-mod sliced_product_sumcheck;
 use jolt_core::field::JoltField;
 use jolt_core::poly::dense_mlpoly::DensePolynomial;
 use jolt_core::subprotocols::sumcheck::{SingleSumcheck, SumcheckInstance};
 use jolt_core::transcripts::{Blake2bTranscript, Transcript};
 use product_sumcheck::ProductSumcheck;
-use sliced_product_sumcheck::SlicedProductSumcheck;
+use product_sumcheck::SlicedProductSumcheck;
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use std::cell::RefCell;
@@ -283,7 +282,7 @@ fn timed_baseline<F: JoltField>(polys: Vec<DensePolynomial<F>>, _threads: usize)
 }
 
 fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, threads: usize) -> (F, f64) {
-    let mut sumcheck = SlicedProductSumcheck::from_polynomials(polys, threads);
+    let mut sumcheck = SlicedProductSumcheck::from_polynomials(polys);
     let start = Instant::now();
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p,_c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
@@ -301,7 +300,7 @@ fn verify_latest<F: JoltField>(t: u32, d: u32, threads: usize) -> Result<(), Box
     let acc1 = Rc::new(RefCell::new(VerifierOpeningAccumulator::<F>::new()));
     SingleSumcheck::verify::<F, Blake2bTranscript>(&base, &p1, Some(acc1), &mut vt1)?;
     // Sliced
-    let mut sliced = SlicedProductSumcheck::from_polynomials(polys, threads);
+    let mut sliced = SlicedProductSumcheck::from_polynomials(polys);
     let mut t2 = Blake2bTranscript::new(b"sumcheck_experiment");
     let (p2,_c2) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sliced, None, &mut t2);
     let mut vt2 = Blake2bTranscript::new(b"sumcheck_experiment");

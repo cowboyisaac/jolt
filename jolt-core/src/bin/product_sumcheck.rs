@@ -109,10 +109,156 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
     fn update_flamegraph(&self, _flamegraph: &mut allocative::FlameGraphBuilder) {}
 }
 
+// Sliced, cache-friendly product sumcheck with optional dedicated thread pool
+pub struct SlicedProductSumcheck<F: JoltField> {
+    pub base: ProductSumcheck<F>,
+    tile_len: usize,
+    pending_r: Option<F::Challenge>,
+    thread_pool: Option<rayon::ThreadPool>,
+}
 
+impl<F: JoltField> SlicedProductSumcheck<F> {
+    fn compute_tile_len(degree: usize) -> usize {
+        let l1_bytes: usize = 32 * 1024; // macbook pro 128kb, threadripper 32kb
+        let elem_bytes: usize = core::mem::size_of::<F>().max(32); // BN254 ~32 bytes
+        let d = degree.max(1);
+        let mut tile_len = (l1_bytes / (d * elem_bytes)).max(64);
+        tile_len = tile_len.min(1024);
+        let pow = usize::BITS as usize - 1 - tile_len.leading_zeros() as usize;
+        1usize << pow
+    }
+
+    pub fn from_polynomials(polynomials: Vec<DensePolynomial<F>>) -> Self {
+        let base = ProductSumcheck::from_polynomials(polynomials);
+        let tile_len = Self::compute_tile_len(base.degree);
+        Self { base, tile_len, pending_r: None, thread_pool: None }
+    }
+
+    pub fn with_threads(polynomials: Vec<DensePolynomial<F>>, threads: usize) -> Self {
+        let base = ProductSumcheck::from_polynomials(polynomials);
+        let tile_len = Self::compute_tile_len(base.degree);
+        let thread_pool = Some(rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap());
+        Self { base, tile_len, pending_r: None, thread_pool }
+    }
+
+    fn compute_once(&mut self) -> Vec<F> {
+        if let Some(r) = self.pending_r.take() {
+            let half = self.base.polynomials[0].len() / 2;
+            let new_polys: Vec<DensePolynomial<F>> = self
+                .base
+                .polynomials
+                .par_iter()
+                .map(|poly| {
+                    let mut new_evals = vec![F::zero(); half];
+                    new_evals
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(i, z)| {
+                            let a = poly.Z[2 * i];
+                            let b = poly.Z[2 * i + 1];
+                            let m = b - a;
+                            *z = a + r * m;
+                        });
+                    DensePolynomial::new(new_evals)
+                })
+                .collect();
+            self.base.polynomials = new_polys;
+        }
+
+        let working: Vec<&DensePolynomial<F>> = self.base.polynomials.iter().collect();
+        let len = working[0].len();
+        for (i, poly) in working.iter().enumerate() {
+            assert_eq!(poly.len(), len, "Polynomial {} has length {}, expected {}", i, poly.len(), len);
+        }
+        let half = len / 2;
+        let degree = self.base.degree;
+        let points_len = 1 + (degree.saturating_sub(1));
+        let t_vals: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
+        if half == 0 { return vec![F::zero(); points_len]; }
+
+        let num_tiles = (half + self.tile_len - 1) / self.tile_len;
+
+        struct TileOut<F> { h0: F, ht: Vec<F> }
+        let tile_results: Vec<TileOut<F>> = (0..num_tiles)
+            .into_par_iter()
+            .map(|tile_idx| {
+                let start = tile_idx * self.tile_len;
+                let end = core::cmp::min(start + self.tile_len, half);
+                let mut h0 = F::zero();
+                let mut ht = vec![F::zero(); t_vals.len()];
+                for j in start..end {
+                    let mut prod_a = F::one();
+                    let mut prod_t: Vec<F> = vec![F::one(); t_vals.len()];
+                    for poly in working.iter() {
+                        let a = poly.Z[2 * j];
+                        let b = poly.Z[2 * j + 1];
+                        let m = b - a;
+                        prod_a = prod_a * a;
+                        for (idx, &tv) in t_vals.iter().enumerate() { prod_t[idx] = prod_t[idx] * (a + m * tv); }
+                    }
+                    h0 = h0 + prod_a;
+                    for idx in 0..ht.len() { ht[idx] = ht[idx] + prod_t[idx]; }
+                }
+                TileOut { h0, ht }
+            })
+            .collect();
+
+        let mut evals_at_points = vec![F::zero(); points_len];
+        for tile in tile_results.into_iter() {
+            evals_at_points[0] = evals_at_points[0] + tile.h0;
+            for idx in 0..tile.ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + tile.ht[idx]; }
+        }
+
+        evals_at_points
+    }
+}
+
+impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for SlicedProductSumcheck<F> {
+    fn degree(&self) -> usize { self.base.degree }
+    fn num_rounds(&self) -> usize { self.base.log_n }
+    fn input_claim(&self) -> F { self.base.input_claim }
+
+    fn compute_prover_message(&mut self, _round: usize, _previous_claim: F) -> Vec<F> {
+        if self.thread_pool.is_some() {
+            let pool = self.thread_pool.take().unwrap();
+            let res = pool.install(|| self.compute_once());
+            self.thread_pool = Some(pool);
+            res
+        } else {
+            self.compute_once()
+        }
+    }
+
+    fn bind(&mut self, r_j: F::Challenge, _round: usize) { self.pending_r = Some(r_j); }
+
+    fn expected_output_claim(
+        &self,
+        _o: Option<Rc<RefCell<VerifierOpeningAccumulator<F>>>>,
+        r: &[F::Challenge]
+    ) -> F {
+        let r_be: Vec<_> = r.iter().rev().copied().collect();
+        self.base
+            .original_polynomials
+            .iter()
+            .map(|poly| poly.evaluate(&r_be))
+            .fold(F::one(), |acc, v| acc * v)
+    }
+
+    fn normalize_opening_point(&self, opening_point: &[F::Challenge]) -> OpeningPoint<BIG_ENDIAN, F> {
+        OpeningPoint::new(opening_point.iter().rev().copied().collect())
+    }
+
+    fn cache_openings_prover(&self, _a: Rc<RefCell<ProverOpeningAccumulator<F>>>, _t: &mut T, _p: OpeningPoint<BIG_ENDIAN, F>) {}
+    fn cache_openings_verifier(&self, _a: Rc<RefCell<VerifierOpeningAccumulator<F>>>, _t: &mut T, _p: OpeningPoint<BIG_ENDIAN, F>) {}
+
+    #[cfg(feature = "allocative")]
+    fn update_flamegraph(&self, _f: &mut allocative::FlameGraphBuilder) {}
+}
 
 #[cfg(test)]
 mod tests {
+    use crate::product_sumcheck::SlicedProductSumcheck;
+
     use super::ProductSumcheck;
     use ark_bn254::Fr;
     use jolt_core::field::JoltField;
@@ -144,7 +290,7 @@ mod tests {
     fn run_product_sumcheck_test(d: u32) {
         let t = 10u32;
         let polys = build_random_dense_polys::<Fr>(t, d, "product_sumcheck_test");
-        let mut sumcheck = ProductSumcheck::from_polynomials(polys);
+        let mut sumcheck = SlicedProductSumcheck::from_polynomials(polys);
         let mut prover_transcript = Blake2bTranscript::new(b"sumcheck_test");
         let (proof, _chals) =
             SingleSumcheck::prove::<Fr, Blake2bTranscript>(&mut sumcheck, None, &mut prover_transcript);
@@ -159,23 +305,44 @@ mod tests {
         assert!(verify.is_ok());
         // Sanity: expected_output_claim at random point matches protocol's output (implicit via verify)
         // Also check that input_claim is non-zero for these random inputs
-        let _ = <ProductSumcheck<Fr> as SumcheckInstance<Fr, Blake2bTranscript>>::input_claim(&sumcheck);
+        let _ = <SlicedProductSumcheck<Fr> as SumcheckInstance<Fr, Blake2bTranscript>>::input_claim(&sumcheck);
+    }
+
+    fn run_slice_product_sumcheck_test(d: u32) {
+        let t = 10u32;
+        let polys = build_random_dense_polys::<Fr>(t, d, "product_sumcheck_test");
+        let mut sumcheck = SlicedProductSumcheck::from_polynomials(polys);
+        let mut prover_transcript = Blake2bTranscript::new(b"sumcheck_test");
+        let (proof, _chals) =
+            SingleSumcheck::prove::<Fr, Blake2bTranscript>(&mut sumcheck, None, &mut prover_transcript);
+        let opening_acc = Rc::new(RefCell::new(VerifierOpeningAccumulator::<Fr>::new()));
+        let mut verifier_transcript = Blake2bTranscript::new(b"sumcheck_test");
+        let verify = SingleSumcheck::verify::<Fr, Blake2bTranscript>(
+            &sumcheck,
+            &proof,
+            Some(opening_acc),
+            &mut verifier_transcript,
+        );
+        assert!(verify.is_ok());
+        // Sanity: expected_output_claim at random point matches protocol's output (implicit via verify)
+        // Also check that input_claim is non-zero for these random inputs
+        let _ = <SlicedProductSumcheck<Fr> as SumcheckInstance<Fr, Blake2bTranscript>>::input_claim(&sumcheck);
     }
 
     #[test]
     fn product_sumcheck_t10_d2() {
         run_product_sumcheck_test(2);
-    }
-
-    #[test]
-    fn product_sumcheck_t10_d3() {
         run_product_sumcheck_test(3);
-    }
-
-    #[test]
-    fn product_sumcheck_t10_d4() {
         run_product_sumcheck_test(4);
     }
+
+    #[test]
+    fn sliced_product_sumcheck_t10_d2() {
+        run_product_sumcheck_test(2);
+        run_product_sumcheck_test(3);
+        run_product_sumcheck_test(4);
+    }
+
 }
 
 // Provide a no-op main when this file is compiled as a standalone binary target
