@@ -196,7 +196,8 @@ fn compare_implementations(t: u32, d: u32, iterations: usize) -> Result<(), Box<
     let mut sliced_times = Vec::new();
 
     for i in 0..iterations {
-    let (polys, claim_baseline, t_base) = timed_baseline::<Fr>(t, d, threads);
+    let polys = build_random_dense_polys::<Fr>(t, d, "fun");
+    let (claim_baseline, t_base) = timed_baseline::<Fr>(polys.clone(), threads);
     let (claim_sliced, t_sliced) = timed_sliced_with_polys::<Fr>(polys, threads);
         println!(
             "  Iteration {:>2}/{}: baseline={:.2}ms, sliced={:.2}ms, claim={}",
@@ -260,9 +261,9 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
     polynomials
 }
 
-fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32, threads: usize) -> Result<F, Box<dyn std::error::Error>> {
+fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32, _threads: usize) -> Result<F, Box<dyn std::error::Error>> {
     let polys = build_random_dense_polys::<F>(t, d, "fun");
-    let mut sumcheck = ProductSumcheck::from_polynomials(polys, threads);
+    let mut sumcheck = ProductSumcheck::from_polynomials(polys);
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_proof, _chals) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
     let mut vt = Blake2bTranscript::new(b"sumcheck_experiment");
@@ -272,14 +273,13 @@ fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32, threads: usize) -> Result
     Ok(<ProductSumcheck<F> as SumcheckInstance<F, Blake2bTranscript>>::input_claim(&sumcheck))
 }
 
-fn timed_baseline<F: JoltField>(t: u32, d: u32, threads: usize) -> (Vec<DensePolynomial<F>>, F, f64) {
-    let polys = build_random_dense_polys::<F>(t, d, "fun");
-    let mut sumcheck = ProductSumcheck::from_polynomials(polys.clone(), threads);
+fn timed_baseline<F: JoltField>(polys: Vec<DensePolynomial<F>>, _threads: usize) -> (F, f64) {
+    let mut sumcheck = ProductSumcheck::from_polynomials(polys);
     let start = Instant::now();
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p,_c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
     let elapsed = start.elapsed().as_secs_f64()*1000.0;
-    (polys, sumcheck.input_claim, elapsed)
+    (sumcheck.input_claim, elapsed)
 }
 
 fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, threads: usize) -> (F, f64) {
@@ -294,7 +294,7 @@ fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, threads
 fn verify_latest<F: JoltField>(t: u32, d: u32, threads: usize) -> Result<(), Box<dyn std::error::Error>> {
     let polys = build_random_dense_polys::<F>(t, d, "fun");
     // Baseline
-    let mut base = ProductSumcheck::from_polynomials(polys.clone(), threads);
+    let mut base = ProductSumcheck::from_polynomials(polys.clone());
     let mut t1 = Blake2bTranscript::new(b"sumcheck_experiment");
     let (p1,_c1) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut base, None, &mut t1);
     let mut vt1 = Blake2bTranscript::new(b"sumcheck_experiment");

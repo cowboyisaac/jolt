@@ -13,11 +13,11 @@ cargo run -p jolt-core --bin bench -- [COMMAND] [OPTIONS]
 
 ### Run Single Experiment
 ```bash
-cargo run -p jolt-core --bin bench -- run --k 10 --d 2 --mode 0 --iterations 5 --threads 4
+cargo run -p jolt-core --bin bench -- run --T 10 --d 2 --mode 0 --iterations 5 --threads 4
 ```
 
 **Options:**
-- `-k, --k <K>`: Size of sumcheck (2^k), default: 10
+- `-T, --T <T>`: Size of sumcheck (2^T), default: 10
 - `-d, --d <D>`: Degree of polynomial, default: 2  
 - `-m, --mode <MODE>`: Mode to run (0-2), default: 0
 - `-i, --iterations <ITERATIONS>`: Number of iterations, default: 1
@@ -25,19 +25,19 @@ cargo run -p jolt-core --bin bench -- run --k 10 --d 2 --mode 0 --iterations 5 -
 
 ### Compare Implementations
 ```bash
-cargo run -p jolt-core --bin bench -- compare --k 10 --d 2 --iterations 5 --threads 4
+cargo run -p jolt-core --bin bench -- compare --T 10 --d 2 --iterations 1 --threads 4
 ```
 
 **Options:**
-- `-k, --k <K>`: Size of sumcheck (2^k), default: 10
+- `-T, --T <T>`: Size of sumcheck (2^T), default: 10
 - `-d, --d <D>`: Degree of polynomial, default: 2
 - `-i, --iterations <ITERATIONS>`: Iterations per mode, default: 5
 - `-t, --threads <THREADS>`: Number of threads (0 = auto-detect), default: 0
 
 ### Batch Experiments
-Run a grid of experiments over k, d, and threads:
+Run a grid of experiments over T, d, and threads:
 ```bash
-cargo run -p jolt-core --bin bench -- batch --k 15,20,24 --d 2,3,4 --threads 4,8,12 --iterations 2
+cargo run -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --threads 4,8,12 --iterations 2
 ```
 
 ## Modes
@@ -62,22 +62,6 @@ The tool uses deterministic pseudo-random data generation with seed "fun":
 - Polynomial coefficients are generated using `StdRng` with the seed
 - This ensures reproducible results across runs
 - Different modes use the same random data for fair comparison
-
-## Examples
-
-```bash
-# Quick test with simple sumcheck
-cargo run -p jolt-core --bin sumcheck_experiment -- run --k 8 --d 2 --mode 0 --threads 4
-
-# Test multi-product sumcheck with degree 3
-cargo run -p jolt-core --bin sumcheck_experiment -- run --k 8 --d 3 --mode 1 --threads 4
-
-# Compare all modes with threading
-cargo run -p jolt-core --bin sumcheck_experiment -- compare --k 10 --d 3 --iterations 10 --threads 8
-
-# Test with auto-detected threads
-cargo run -p jolt-core --bin sumcheck_experiment -- run --k 12 --d 2 --mode 2
-```
 
 ## Threading & Tiling
 
@@ -115,11 +99,11 @@ This makes the experiments highly credible and representative of actual Jolt sum
 ## Examples
 ```bash
 # Single run
-cargo run -p jolt-core --bin bench -- run --k 18 --d 3 --mode 0 --iterations 2 --threads 8
+cargo run -p jolt-core --bin bench -- run --T 18 --d 3 --mode 0 --iterations 1 --threads 8
 
 # Compare baseline vs sliced for a single setting
-cargo run -p jolt-core --bin bench -- compare --k 18 --d 3 --iterations 3 --threads 8
+cargo run -p jolt-core --bin bench -- compare --T 15 --d 2 --iterations 1 --threads 8
 
 # Batch grid
-cargo run -p jolt-core --bin bench -- batch --k 15,20,24 --d 2,3,4 --threads 4,8,12 --iterations 2
+cargo run -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --threads 4,8,12 --iterations 2
 ```
