@@ -34,9 +34,15 @@ cargo run -p jolt-core --bin bench -- compare --k 10 --d 2 --iterations 5 --thre
 - `-i, --iterations <ITERATIONS>`: Iterations per mode, default: 5
 - `-t, --threads <THREADS>`: Number of threads (0 = auto-detect), default: 0
 
+### Batch Experiments
+Run a grid of experiments over k, d, and threads:
+```bash
+cargo run -p jolt-core --bin bench -- batch --k 15,20,24 --d 2,3,4 --threads 4,8,12 --iterations 2
+```
+
 ## Modes
 
-- **Mode 0 - Baseline (SingleSumcheck)**: Uses `SingleSumcheck` with `MultilinearProductSumcheckInstance` (configurable degree d)
+- **Mode 0 - Baseline (SingleSumcheck)**: Uses `SingleSumcheck` with `ProductSumcheck` (configurable degree d)
 
 ## Implementation Details
 
@@ -73,13 +79,17 @@ cargo run -p jolt-core --bin sumcheck_experiment -- compare --k 10 --d 3 --itera
 cargo run -p jolt-core --bin sumcheck_experiment -- run --k 12 --d 2 --mode 2
 ```
 
-## Threading
+## Threading & Tiling
 
 The tool supports configurable threading:
 - Set `--threads 0` (default) to auto-detect the number of CPU cores
 - Set `--threads N` to use exactly N threads
-- All modes use parallel processing with rayon for polynomial operations
-- Different parallelization strategies are used across modes for comparison
+- All modes use parallel processing with rayon for polynomial operations.
+- Baseline uses contiguous memory traversal and a dedicated threadpool when `--threads > 0`.
+- Sliced uses tiled evaluation to improve cache locality. Tile length is auto-tuned to fit L1 cache:
+  - `tile_len ≈ L1_bytes / (degree * elem_bytes)`, clamped to [64, 1024] and rounded to a power of two.
+  - Binding uses HighToLow to match Jolt’s sumcheck pairing `[2*j], [2*j+1]`.
+  - Tiled loops precompute products for h(0) and h(t) across all t in a single pass.
 
 ## Output
 
@@ -88,8 +98,8 @@ The tool provides detailed timing information including:
 - Total execution time
 - Average time per iteration
 - Minimum and maximum times
-- Success/failure status
-- Performance comparison rankings
+- Success/failure status and explicit proof verification (both baseline and sliced).
+- Baseline vs Sliced timing with avg/med/min/max and a speedup factor (Baseline/Sliced).
 
 ## Credibility
 
@@ -101,3 +111,15 @@ This tool uses the actual Jolt `SingleSumcheck` abstraction and infrastructure:
 - Correct field arithmetic and challenge types
 
 This makes the experiments highly credible and representative of actual Jolt sumcheck performance characteristics.
+
+## Examples
+```bash
+# Single run
+cargo run -p jolt-core --bin bench -- run --k 18 --d 3 --mode 0 --iterations 2 --threads 8
+
+# Compare baseline vs sliced for a single setting
+cargo run -p jolt-core --bin bench -- compare --k 18 --d 3 --iterations 3 --threads 8
+
+# Batch grid
+cargo run -p jolt-core --bin bench -- batch --k 15,20,24 --d 2,3,4 --threads 4,8,12 --iterations 2
+```
