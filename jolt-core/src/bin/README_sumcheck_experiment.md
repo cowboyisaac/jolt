@@ -6,14 +6,14 @@ A command-line tool for experimenting with different sumcheck implementations us
 
 ```bash
 # Run from the jolt root directory
-cargo run -p jolt-core --bin sumcheck_experiment -- [COMMAND] [OPTIONS]
+cargo run -p jolt-core --bin bench -- [COMMAND] [OPTIONS]
 ```
 
 ## Commands
 
 ### Run Single Experiment
 ```bash
-cargo run -p jolt-core --bin sumcheck_experiment -- run --k 10 --d 2 --mode 1 --iterations 5 --threads 4
+cargo run -p jolt-core --bin bench -- run --k 10 --d 2 --mode 0 --iterations 5 --threads 4
 ```
 
 **Options:**
@@ -25,7 +25,7 @@ cargo run -p jolt-core --bin sumcheck_experiment -- run --k 10 --d 2 --mode 1 --
 
 ### Compare Implementations
 ```bash
-cargo run -p jolt-core --bin sumcheck_experiment -- compare --k 10 --d 2 --iterations 5 --threads 4
+cargo run -p jolt-core --bin bench -- compare --k 10 --d 2 --iterations 5 --threads 4
 ```
 
 **Options:**
@@ -36,9 +36,7 @@ cargo run -p jolt-core --bin sumcheck_experiment -- compare --k 10 --d 2 --itera
 
 ## Modes
 
-- **Mode 0 - Simple Sumcheck**: Uses `SingleSumcheck` with a basic `SumcheckInstance` implementation (degree 2)
-- **Mode 1 - Multi-Product Sumcheck**: Uses `SingleSumcheck` with a multi-product `SumcheckInstance` (configurable degree d)
-- **Mode 2 - Multi-Product Sumcheck**: Same as Mode 1, for comparison
+- **Mode 0 - Baseline (SingleSumcheck)**: Uses `SingleSumcheck` with `MultilinearProductSumcheckInstance` (configurable degree d)
 
 ## Implementation Details
 

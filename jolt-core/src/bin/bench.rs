@@ -2,12 +2,12 @@ use clap::{Parser, Subcommand};
 use ark_bn254::Fr;
 use std::time::Instant;
 
-mod sumcheck_implementations;
-use sumcheck_implementations::{run_baseline_sumcheck, run_tile_sumcheck};
+mod r#impl;
+use r#impl::run_baseline_sumcheck;
 
 #[derive(Parser)]
-#[command(name = "sumcheck-experiment")]
-#[command(about = "A tool for experimenting with sumcheck implementations and performance")]
+#[command(name = "bench")]
+#[command(about = "A tool for benchmarking sumcheck implementations and performance")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -25,7 +25,7 @@ enum Commands {
         #[arg(short, long, default_value = "2")]
         d: u32,
         
-        /// Mode to run (0=baseline, 1=tile)
+        /// Mode to run (0=baseline)
         #[arg(short, long, default_value = "0")]
         mode: u32,
         
@@ -111,7 +111,6 @@ fn run_single_experiment(k: u32, d: u32, mode: u32, iterations: usize) {
         let start = Instant::now();
         let result = match mode {
             0 => run_baseline_sumcheck::<Fr>(k, d, threads),
-            1 => run_tile_sumcheck::<Fr>(k, d, threads),
             _ => {
                 println!("Unknown mode {}, falling back to mode 0", mode);
                 run_baseline_sumcheck::<Fr>(k, d, threads)
@@ -141,7 +140,11 @@ fn run_single_experiment(k: u32, d: u32, mode: u32, iterations: usize) {
         let max_time = times.iter().cloned().fold(0.0, f64::max);
         
         println!("\nExperiment completed:");
-        println!("  Mode: {}", mode);
+        let mode_name = match mode {
+            0 => "Baseline (SingleSumcheck)",
+            _ => "Unknown",
+        };
+        println!("  Mode: {} ({})", mode, mode_name);
         println!("  Size: 2^{} = {}", k, 1 << k);
         println!("  Degree: {}", d);
         println!("  Iterations: {}", times.len());
@@ -158,7 +161,6 @@ fn compare_implementations(k: u32, d: u32, iterations: usize) {
     
     let modes = vec![
         (0, "Baseline (SingleSumcheck)"),
-        (1, "Tile (SingleTileSumcheck)"),
     ];
     
     let mut results = Vec::new();
@@ -174,7 +176,6 @@ fn compare_implementations(k: u32, d: u32, iterations: usize) {
             let start = Instant::now();
             let result = match mode {
                 0 => run_baseline_sumcheck::<Fr>(k, d, threads),
-                1 => run_tile_sumcheck::<Fr>(k, d, threads),
                 _ => run_baseline_sumcheck::<Fr>(k, d, threads),
             };
             let duration = start.elapsed();
