@@ -43,9 +43,9 @@ enum Commands {
         #[arg(short, long, default_value = "1")]
         iterations: usize,
         
-        /// Number of threads to use (0 = auto-detect)
+        /// Deprecated. Threads are auto-managed by rayon now.
         #[arg(short, long, default_value = "0")]
-        threads: usize,
+        _threads: usize,
     },
     /// Compare different sumcheck implementations
     Compare {
@@ -60,10 +60,6 @@ enum Commands {
         /// Number of iterations per mode
         #[arg(short, long, default_value = "5")]
         iterations: usize,
-        
-        /// Number of threads to use (0 = auto-detect)
-        #[arg(short, long, default_value = "0")]
-        threads: usize,
     },
     /// Batch compare across grids of T, d, threads
     Batch {
@@ -73,8 +69,8 @@ enum Commands {
         /// Degrees d. Comma-separated list, e.g. 2,3,4
         #[arg(long = "d", value_delimiter = ',', required = true)]
         d_list: Vec<u32>,
-        /// Threads. Comma-separated list, e.g. 4,8,12 (0 means auto)
-        #[arg(long = "threads", value_delimiter = ',', required = true)]
+        /// Deprecated. Threads are auto-managed by rayon now.
+        #[arg(long = "threads", value_delimiter = ',', required = false)]
         threads_list: Vec<usize>,
         /// Iterations per setting
         #[arg(short, long, default_value = "2")]
@@ -91,18 +87,15 @@ fn main() {
             d,
             mode,
             iterations,
-            threads,
+            _threads,
         } => {
-            setup_threading(threads);
             run_single_experiment(t, d, mode, iterations);
         }
         Commands::Compare {
             t,
             d,
             iterations,
-            threads,
         } => {
-            setup_threading(threads);
             match compare_implementations(t, d, iterations) {
                 Ok(()) => println!("\nCompare finished successfully."),
                 Err(e) => eprintln!("\nCompare failed: {}", e),
@@ -114,18 +107,7 @@ fn main() {
     }
 }
 
-fn setup_threading(threads: usize) {
-    if threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-            .unwrap();
-        println!("Using {} threads", threads);
-    } else {
-        let num_threads = rayon::current_num_threads();
-        println!("Using {} threads (auto-detected)", num_threads);
-    }
-}
+// Threads are auto-managed by rayon now.
 
 fn run_single_experiment(t: u32, d: u32, mode: u32, iterations: usize) {
     println!("Running sumcheck experiment: T={}, d={}, mode={}, iterations={}", t, d, mode, iterations);
@@ -133,7 +115,6 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, iterations: usize) {
     let mut times = Vec::new();
     let mut success = true;
     let mut _error_msg = None;
-    let threads = rayon::current_num_threads();
     
     for i in 0..iterations {
         println!("Iteration {}/{}", i + 1, iterations);
@@ -141,10 +122,10 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, iterations: usize) {
         // Only profile the proving time, not verification
         let start = Instant::now();
         let result = match mode {
-            0 => run_baseline_sumcheck::<Fr>(t, d, threads),
+            0 => run_baseline_sumcheck::<Fr>(t, d),
             _ => {
                 println!("Unknown mode {}, falling back to mode 0", mode);
-                run_baseline_sumcheck::<Fr>(t, d, threads)
+                run_baseline_sumcheck::<Fr>(t, d)
             }
         };
         let duration = start.elapsed();
@@ -189,21 +170,20 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, iterations: usize) {
 
 fn compare_implementations(t: u32, d: u32, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("Comparing sumcheck implementations: T={}, d={}, iterations={}", t, d, iterations);
-    let threads = rayon::current_num_threads();
 
     let mut baseline_times = Vec::new();
     let mut sliced_times = Vec::new();
 
     for i in 0..iterations {
     let polys = build_random_dense_polys::<Fr>(t, d, "fun");
-    let (claim_baseline, t_base) = timed_baseline::<Fr>(polys.clone(), threads);
-    let (claim_sliced, t_sliced) = timed_sliced_with_polys::<Fr>(polys, threads);
+    let (claim_baseline, t_base) = timed_baseline::<Fr>(polys.clone());
+    let (claim_sliced, t_sliced) = timed_sliced_with_polys::<Fr>(polys);
         println!(
             "  Iteration {:>2}/{}: baseline={:.2}ms, sliced={:.2}ms, claim={}",
             i+1, iterations, t_base, t_sliced, claim_baseline
         );
     // Verify proofs for both implementations
-        verify_latest::<Fr>(t, d, threads)?;
+        verify_latest::<Fr>(t, d)?;
         assert_eq!(claim_baseline, claim_sliced, "Claims differ between baseline and sliced");
         baseline_times.push(t_base);
         sliced_times.push(t_sliced);
@@ -221,7 +201,7 @@ fn compare_implementations(t: u32, d: u32, iterations: usize) -> Result<(), Box<
     let (b_avg,b_med,b_min,b_max) = stats(&baseline_times);
     let (s_avg,s_med,s_min,s_max) = stats(&sliced_times);
 
-    println!("\nThreads: configured={}, rayon_current={}", threads, rayon::current_num_threads());
+    println!("\nThreads: rayon_current={}", rayon::current_num_threads());
     println!("Problem: n=2^{}, degree={} polys", t, d);
     println!("Baseline: avg={:.2}ms, med={:.2}ms, min={:.2}ms, max={:.2}ms", b_avg,b_med,b_min,b_max);
     println!("Sliced:   avg={:.2}ms, med={:.2}ms, min={:.2}ms, max={:.2}ms", s_avg,s_med,s_min,s_max);
@@ -233,11 +213,18 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, threads_list: Vec<u
     println!("Batch experiments: Ts={:?}, ds={:?}, threads={:?}, iterations={}", t_list, d_list, threads_list, iterations);
     for &t in &t_list {
         for &d in &d_list {
-            for &threads in &threads_list {
-                if threads > 0 { let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global(); }
-                println!("\n== Case: T={}, d={}, threads={} ==", t, d, if threads==0 { rayon::current_num_threads() } else { threads });
+            if threads_list.is_empty() {
+                println!("\n== Case: T={}, d={}, threads={} ==", t, d, rayon::current_num_threads());
                 if let Err(e) = compare_implementations(t, d, iterations) {
                     println!("  ERROR: {}", e);
+                }
+            } else {
+                for threads in threads_list.iter().cloned() {
+                    if threads > 0 { let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global(); }
+                    println!("\n== Case: T={}, d={}, threads={} ==", t, d, if threads==0 { rayon::current_num_threads() } else { threads });
+                    if let Err(e) = compare_implementations(t, d, iterations) {
+                        println!("  ERROR: {}", e);
+                    }
                 }
             }
         }
@@ -260,7 +247,7 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
     polynomials
 }
 
-fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32, _threads: usize) -> Result<F, Box<dyn std::error::Error>> {
+fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32) -> Result<F, Box<dyn std::error::Error>> {
     let polys = build_random_dense_polys::<F>(t, d, "fun");
     let mut sumcheck = ProductSumcheck::from_polynomials(polys);
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
@@ -272,7 +259,7 @@ fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32, _threads: usize) -> Resul
     Ok(<ProductSumcheck<F> as SumcheckInstance<F, Blake2bTranscript>>::input_claim(&sumcheck))
 }
 
-fn timed_baseline<F: JoltField>(polys: Vec<DensePolynomial<F>>, _threads: usize) -> (F, f64) {
+fn timed_baseline<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64) {
     let mut sumcheck = ProductSumcheck::from_polynomials(polys);
     let start = Instant::now();
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
@@ -281,7 +268,7 @@ fn timed_baseline<F: JoltField>(polys: Vec<DensePolynomial<F>>, _threads: usize)
     (sumcheck.input_claim, elapsed)
 }
 
-fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, threads: usize) -> (F, f64) {
+fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64) {
     let mut sumcheck = SlicedProductSumcheck::from_polynomials(polys);
     let start = Instant::now();
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
@@ -290,7 +277,7 @@ fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, threads
     (sumcheck.base.input_claim, elapsed)
 }
 
-fn verify_latest<F: JoltField>(t: u32, d: u32, threads: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_latest<F: JoltField>(t: u32, d: u32) -> Result<(), Box<dyn std::error::Error>> {
     let polys = build_random_dense_polys::<F>(t, d, "fun");
     // Baseline
     let mut base = ProductSumcheck::from_polynomials(polys.clone());

@@ -114,7 +114,6 @@ pub struct SlicedProductSumcheck<F: JoltField> {
     pub base: ProductSumcheck<F>,
     tile_len: usize,
     pending_r: Option<F::Challenge>,
-    thread_pool: Option<rayon::ThreadPool>,
 }
 
 impl<F: JoltField> SlicedProductSumcheck<F> {
@@ -131,15 +130,10 @@ impl<F: JoltField> SlicedProductSumcheck<F> {
     pub fn from_polynomials(polynomials: Vec<DensePolynomial<F>>) -> Self {
         let base = ProductSumcheck::from_polynomials(polynomials);
         let tile_len = Self::compute_tile_len(base.degree);
-        Self { base, tile_len, pending_r: None, thread_pool: None }
+        Self { base, tile_len, pending_r: None }
     }
 
-    pub fn with_threads(polynomials: Vec<DensePolynomial<F>>, threads: usize) -> Self {
-        let base = ProductSumcheck::from_polynomials(polynomials);
-        let tile_len = Self::compute_tile_len(base.degree);
-        let thread_pool = Some(rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap());
-        Self { base, tile_len, pending_r: None, thread_pool }
-    }
+    // Dedicated per-instance thread pools are no longer used; rayon manages threads globally.
 
     fn compute_once(&mut self) -> Vec<F> {
         if let Some(r) = self.pending_r.take() {
@@ -219,14 +213,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for SlicedProductSumche
     fn input_claim(&self) -> F { self.base.input_claim }
 
     fn compute_prover_message(&mut self, _round: usize, _previous_claim: F) -> Vec<F> {
-        if self.thread_pool.is_some() {
-            let pool = self.thread_pool.take().unwrap();
-            let res = pool.install(|| self.compute_once());
-            self.thread_pool = Some(pool);
-            res
-        } else {
-            self.compute_once()
-        }
+        self.compute_once()
     }
 
     fn bind(&mut self, r_j: F::Challenge, _round: usize) { self.pending_r = Some(r_j); }
@@ -257,9 +244,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for SlicedProductSumche
 
 #[cfg(test)]
 mod tests {
-    use crate::product_sumcheck::SlicedProductSumcheck;
-
-    use super::ProductSumcheck;
+    use super::{ProductSumcheck, SlicedProductSumcheck};
     use ark_bn254::Fr;
     use jolt_core::field::JoltField;
     use jolt_core::poly::dense_mlpoly::DensePolynomial;
