@@ -192,52 +192,7 @@ impl<F: JoltField> ProductSumcheck<F> {
         let mut evals_at_points = vec![F::zero(); points_len];
 
         if let Some(r) = r_opt {
-            // Phase 1: evaluate in parallel over tiles using on-the-fly y0/y1 (no bound array reads/writes here)
-            let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
-                .into_par_iter()
-                .map(|tile_idx| {
-                    let start = tile_idx * s.tile_len;
-                    let end = core::cmp::min(start + s.tile_len, half_before);
-                    let start_even = start & !1;
-                    let end_even = end & !1;
-                    let k_start = start_even / 2;
-                    let k_end = end_even / 2;
-
-                    // Per-tile accumulators
-                    let mut tile_h0_accumulator = F::zero();
-                    let mut tile_ht_accumulator = vec![F::zero(); t_len];
-                    let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
-
-                    for k in k_start..k_end {
-                        // Accumulate across polynomials
-                        let mut prod_a_accumulator = F::one();
-                        for p_idx in 0..num_polys {
-                            // Compute y0,y1 on the fly from the source arrays (no interim writes/reads)
-                            let a00 = working[p_idx].Z[4 * k + 0];
-                            let a01 = working[p_idx].Z[4 * k + 1];
-                            let a10 = working[p_idx].Z[4 * k + 2];
-                            let a11 = working[p_idx].Z[4 * k + 3];
-                            let y0 = a00 + r * (a01 - a00);
-                            let y1 = a10 + r * (a11 - a10);
-                            let m2 = y1 - y0;
-
-                            prod_a_accumulator = prod_a_accumulator * y0;
-                            for (idx, &tv) in t_vals.iter().enumerate() { prod_t_accumulator[idx] = prod_t_accumulator[idx] * (y0 + m2 * tv); }
-                        }
-                        tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
-                        for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
-                        for v in &mut prod_t_accumulator { *v = F::one(); }
-                    }
-                    (tile_h0_accumulator, tile_ht_accumulator)
-                })
-                .collect();
-
-            for (h0, ht) in tile_evals.into_iter() {
-                evals_at_points[0] = evals_at_points[0] + h0;
-                for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
-            }
-
-            // Phase 2: bind arrays once for the next round (parallel over polynomials), reusing buffer
+            // Phase 1: bind arrays once for the next round (parallel over polynomials), reusing buffer
             let mut next_polys = s
                 .next_polys
                 .take()
@@ -261,8 +216,57 @@ impl<F: JoltField> ProductSumcheck<F> {
                     }
                 });
 
-            self.polynomials = next_polys;
-            s.next_polys = Some(self.polynomials.clone());
+            // Phase 2: evaluate in parallel over tiles reading bound arrays (no duplicate y computation)
+            let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
+                .into_par_iter()
+                .map(|tile_idx| {
+                    let start = tile_idx * s.tile_len;
+                    let end = core::cmp::min(start + s.tile_len, half_before);
+                    let start_even = start & !1;
+                    let end_even = end & !1;
+                    let k_start = start_even / 2;
+                    let k_end = end_even / 2;
+
+                    // Per-tile accumulators
+                    let mut tile_h0_accumulator = F::zero();
+                    let mut tile_ht_accumulator = vec![F::zero(); t_len];
+                    let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
+
+                    for k in k_start..k_end {
+                        let mut prod_a_accumulator = F::one();
+                        for poly in next_polys.iter() {
+                            let y0 = poly.Z[2 * k];
+                            let y1 = poly.Z[2 * k + 1];
+                            let m2 = y1 - y0;
+                            prod_a_accumulator = prod_a_accumulator * y0;
+                            if t_len > 0 {
+                                // Incremental evaluation across t: v_t = y0 + m2 * t; next t adds m2
+                                let mut v_t = y0 + m2 * t_vals[0];
+                                // idx = 0
+                                prod_t_accumulator[0] = prod_t_accumulator[0] * v_t;
+                                // idx >= 1
+                                for idx in 1..t_len {
+                                    v_t = v_t + m2;
+                                    prod_t_accumulator[idx] = prod_t_accumulator[idx] * v_t;
+                                }
+                            }
+                        }
+                        tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
+                        for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
+                        for v in &mut prod_t_accumulator { *v = F::one(); }
+                    }
+                    (tile_h0_accumulator, tile_ht_accumulator)
+                })
+                .collect();
+
+            for (h0, ht) in tile_evals.into_iter() {
+                evals_at_points[0] = evals_at_points[0] + h0;
+                for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
+            }
+
+            // Swap in bound arrays and keep previous buffers for reuse without cloning
+            let old_polys = std::mem::replace(&mut self.polynomials, next_polys);
+            s.next_polys = Some(old_polys);
         } else {
             // No binding yet (round 0): evaluate directly from current arrays using full-size pairs
             let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
@@ -282,7 +286,15 @@ impl<F: JoltField> ProductSumcheck<F> {
                             let b = poly.Z[2 * j + 1];
                             let m = b - a;
                             prod_a_accumulator = prod_a_accumulator * a;
-                            for (idx, &tv) in t_vals.iter().enumerate() { prod_t_accumulator[idx] = prod_t_accumulator[idx] * (a + m * tv); }
+                            if t_len > 0 {
+                                // v_t = a + m * t; update incrementally by adding m
+                                let mut v_t = a + m * t_vals[0];
+                                prod_t_accumulator[0] = prod_t_accumulator[0] * v_t;
+                                for idx in 1..t_len {
+                                    v_t = v_t + m;
+                                    prod_t_accumulator[idx] = prod_t_accumulator[idx] * v_t;
+                                }
+                            }
                         }
                         tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
                         for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
