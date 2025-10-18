@@ -28,6 +28,8 @@ pub struct StreamingState<F: JoltField> {
     pub tile_len: usize,
     pub pending_r: Option<F::Challenge>,
     pub t_vals: Vec<F>,
+    // Reusable buffer for next-round bound polynomials to avoid reallocations
+    pub next_polys: Option<Vec<DensePolynomial<F>>>,
 }
 
 impl<F: JoltField> StreamingState<F> {
@@ -48,6 +50,7 @@ impl<F: JoltField> StreamingState<F> {
             tile_len,
             pending_r: None,
             t_vals,
+            next_polys: None,
         }
     }
 }
@@ -189,67 +192,77 @@ impl<F: JoltField> ProductSumcheck<F> {
         let mut evals_at_points = vec![F::zero(); points_len];
 
         if let Some(r) = r_opt {
-            // Allocate the next bound arrays (length halves each round)
-            let mut next_polys: Vec<DensePolynomial<F>> = (0..num_polys)
-                .map(|_| DensePolynomial::new(vec![F::zero(); half_before]))
+            // Phase 1: evaluate in parallel over tiles using on-the-fly y0/y1 (no bound array reads/writes here)
+            let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
+                .into_par_iter()
+                .map(|tile_idx| {
+                    let start = tile_idx * s.tile_len;
+                    let end = core::cmp::min(start + s.tile_len, half_before);
+                    let start_even = start & !1;
+                    let end_even = end & !1;
+                    let k_start = start_even / 2;
+                    let k_end = end_even / 2;
+
+                    // Per-tile accumulators
+                    let mut tile_h0_accumulator = F::zero();
+                    let mut tile_ht_accumulator = vec![F::zero(); t_len];
+                    let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
+
+                    for k in k_start..k_end {
+                        // Accumulate across polynomials
+                        let mut prod_a_accumulator = F::one();
+                        for p_idx in 0..num_polys {
+                            // Compute y0,y1 on the fly from the source arrays (no interim writes/reads)
+                            let a00 = working[p_idx].Z[4 * k + 0];
+                            let a01 = working[p_idx].Z[4 * k + 1];
+                            let a10 = working[p_idx].Z[4 * k + 2];
+                            let a11 = working[p_idx].Z[4 * k + 3];
+                            let y0 = a00 + r * (a01 - a00);
+                            let y1 = a10 + r * (a11 - a10);
+                            let m2 = y1 - y0;
+
+                            prod_a_accumulator = prod_a_accumulator * y0;
+                            for (idx, &tv) in t_vals.iter().enumerate() { prod_t_accumulator[idx] = prod_t_accumulator[idx] * (y0 + m2 * tv); }
+                        }
+                        tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
+                        for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
+                        for v in &mut prod_t_accumulator { *v = F::one(); }
+                    }
+                    (tile_h0_accumulator, tile_ht_accumulator)
+                })
                 .collect();
 
-            for tile_idx in 0..num_tiles {
-                let start = tile_idx * s.tile_len;
-                let end = core::cmp::min(start + s.tile_len, half_before);
-
-                // 1) Tile bind: y[j] = a + r*(b-a) for j in [start, end)
-                //    Writes into next_polys while reading from current working arrays.
-                for p_idx in 0..num_polys {
-                    let src = &working[p_idx].Z;
-                    let dst = &mut next_polys[p_idx].Z;
-                    for j in start..end {
-                        let a = src[2 * j];
-                        let b = src[2 * j + 1];
-                        dst[j] = a + r * (b - a);
-                    }
-                }
-
-                // 2) Tile evaluate: accumulate contributions from reduced pairs (2k,2k+1)
-                //    Accumulate into tile-level accumulators, then fold into round accumulator.
-                let start_even = start & !1;
-                let end_even = end & !1;
-                let k_start = start_even / 2;
-                let k_end = end_even / 2;
-
-                // Per-tile accumulators
-                let mut tile_h0_accumulator = F::zero();
-                let mut tile_ht_accumulator = vec![F::zero(); t_len];
-                let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
-
-                for k in k_start..k_end {
-                    // Product accumulators across polynomials for this reduced pair
-                    let mut prod_a_accumulator = F::one();
-                    // For each polynomial, update the running products
-                    for p_idx in 0..num_polys {
-                        let y0 = next_polys[p_idx].Z[2 * k];
-                        let y1 = next_polys[p_idx].Z[2 * k + 1];
-                        let m2 = y1 - y0;
-
-                        prod_a_accumulator = prod_a_accumulator * y0;
-                        // Evaluate (y0 + m2 * t) for all t and multiply into the prod_t accumulator
-                        for (idx, &tv) in t_vals.iter().enumerate() {
-                            // prod_t_accumulator[idx] *= (y0 + m2 * tv)
-                            prod_t_accumulator[idx] = prod_t_accumulator[idx] * (y0 + m2 * tv);
-                        }
-                    }
-                    tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
-                    for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
-                    // Reset the prod_t accumulator back to 1 for the next reduced pair
-                    for v in &mut prod_t_accumulator { *v = F::one(); }
-                }
-
-                // Fold tile accumulators into the round accumulator
-                evals_at_points[0] = evals_at_points[0] + tile_h0_accumulator;
-                for idx in 0..t_len { evals_at_points[idx + 1] = evals_at_points[idx + 1] + tile_ht_accumulator[idx]; }
+            for (h0, ht) in tile_evals.into_iter() {
+                evals_at_points[0] = evals_at_points[0] + h0;
+                for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
             }
 
+            // Phase 2: bind arrays once for the next round (parallel over polynomials), reusing buffer
+            let mut next_polys = s
+                .next_polys
+                .take()
+                .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect());
+            if next_polys.len() != num_polys {
+                next_polys = (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect();
+            }
+            for p in 0..num_polys {
+                if next_polys[p].len() != half_before { next_polys[p] = DensePolynomial::new(vec![F::zero(); half_before]); }
+            }
+
+            next_polys
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(p_idx, dst)| {
+                    let src = &working[p_idx].Z;
+                    for j in 0..half_before {
+                        let a = src[2 * j];
+                        let b = src[2 * j + 1];
+                        dst.Z[j] = a + r * (b - a);
+                    }
+                });
+
             self.polynomials = next_polys;
+            s.next_polys = Some(self.polynomials.clone());
         } else {
             // No binding yet (round 0): evaluate directly from current arrays using full-size pairs
             let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
