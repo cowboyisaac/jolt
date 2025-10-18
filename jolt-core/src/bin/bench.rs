@@ -7,8 +7,7 @@ use jolt_core::field::JoltField;
 use jolt_core::poly::dense_mlpoly::DensePolynomial;
 use jolt_core::subprotocols::sumcheck::{SingleSumcheck, SumcheckInstance};
 use jolt_core::transcripts::{Blake2bTranscript, Transcript};
-use product_sumcheck::ProductSumcheck;
-use product_sumcheck::SlicedProductSumcheck;
+use product_sumcheck::{ProductSumcheck, ExecutionMode};
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use std::cell::RefCell;
@@ -123,6 +122,7 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, iterations: usize) {
         let start = Instant::now();
         let result = match mode {
             0 => run_baseline_sumcheck::<Fr>(t, d),
+            1 => run_streaming_sumcheck::<Fr>(t, d),
             _ => {
                 println!("Unknown mode {}, falling back to mode 0", mode);
                 run_baseline_sumcheck::<Fr>(t, d)
@@ -153,7 +153,8 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, iterations: usize) {
         
         println!("\nExperiment completed:");
         let mode_name = match mode {
-            0 => "Baseline (SingleSumcheck)",
+            0 => "Baseline (Batch)",
+            1 => "Streaming (Tiled)",
             _ => "Unknown",
         };
         println!("  Mode: {} ({})", mode, mode_name);
@@ -172,21 +173,21 @@ fn compare_implementations(t: u32, d: u32, iterations: usize) -> Result<(), Box<
     println!("Comparing sumcheck implementations: T={}, d={}, iterations={}", t, d, iterations);
 
     let mut baseline_times = Vec::new();
-    let mut sliced_times = Vec::new();
+    let mut streaming_times = Vec::new();
 
     for i in 0..iterations {
     let polys = build_random_dense_polys::<Fr>(t, d, "fun");
     let (claim_baseline, t_base) = timed_baseline::<Fr>(polys.clone());
-    let (claim_sliced, t_sliced) = timed_sliced_with_polys::<Fr>(polys);
+    let (claim_streaming, t_streaming) = timed_streaming_with_polys::<Fr>(polys);
         println!(
-            "  Iteration {:>2}/{}: baseline={:.2}ms, sliced={:.2}ms, claim={}",
-            i+1, iterations, t_base, t_sliced, claim_baseline
+            "  Iteration {:>2}/{}: baseline={:.2}ms, streaming={:.2}ms, claim={}",
+            i+1, iterations, t_base, t_streaming, claim_baseline
         );
     // Verify proofs for both implementations
         // verify_latest::<Fr>(t, d)?;
-        assert_eq!(claim_baseline, claim_sliced, "Claims differ between baseline and sliced");
+        assert_eq!(claim_baseline, claim_streaming, "Claims differ between baseline and streaming");
         baseline_times.push(t_base);
-        sliced_times.push(t_sliced);
+        streaming_times.push(t_streaming);
     }
 
     let stats = |v: &Vec<f64>| {
@@ -199,13 +200,13 @@ fn compare_implementations(t: u32, d: u32, iterations: usize) -> Result<(), Box<
         (avg, med, min, max)
     };
     let (b_avg,b_med,b_min,b_max) = stats(&baseline_times);
-    let (s_avg,s_med,s_min,s_max) = stats(&sliced_times);
+    let (s_avg,s_med,s_min,s_max) = stats(&streaming_times);
 
     println!("\nThreads: rayon_current={}", rayon::current_num_threads());
     println!("Problem: n=2^{}, degree={} polys", t, d);
     println!("Baseline: avg={:.2}ms, med={:.2}ms, min={:.2}ms, max={:.2}ms", b_avg,b_med,b_min,b_max);
-    println!("Sliced:   avg={:.2}ms, med={:.2}ms, min={:.2}ms, max={:.2}ms", s_avg,s_med,s_min,s_max);
-    if s_avg>0.0 { println!("Speedup (Baseline/Sliced): {:.2}x", b_avg/s_avg); }
+    println!("Streaming:   avg={:.2}ms, med={:.2}ms, min={:.2}ms, max={:.2}ms", s_avg,s_med,s_min,s_max);
+    if s_avg>0.0 { println!("Speedup (Baseline/Streaming): {:.2}x", b_avg/s_avg); }
     Ok(())
 }
 
@@ -249,7 +250,7 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
 
 fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32) -> Result<F, Box<dyn std::error::Error>> {
     let polys = build_random_dense_polys::<F>(t, d, "fun");
-    let mut sumcheck = ProductSumcheck::from_polynomials(polys);
+    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Batch);
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_proof, _chals) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
     let mut vt = Blake2bTranscript::new(b"sumcheck_experiment");
@@ -259,8 +260,20 @@ fn run_baseline_sumcheck<F: JoltField>(t: u32, d: u32) -> Result<F, Box<dyn std:
     Ok(<ProductSumcheck<F> as SumcheckInstance<F, Blake2bTranscript>>::input_claim(&sumcheck))
 }
 
+fn run_streaming_sumcheck<F: JoltField>(t: u32, d: u32) -> Result<F, Box<dyn std::error::Error>> {
+    let polys = build_random_dense_polys::<F>(t, d, "fun");
+    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Streaming);
+    let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
+    let (_proof, _chals) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
+    let mut vt = Blake2bTranscript::new(b"sumcheck_experiment");
+    let opening_acc = Rc::new(RefCell::new(VerifierOpeningAccumulator::<F>::new()));
+    let verify = SingleSumcheck::verify::<F, Blake2bTranscript>(&sumcheck, &_proof, Some(opening_acc), &mut vt);
+    assert!(verify.is_ok(), "Streaming sumcheck verification failed");
+    Ok(<ProductSumcheck<F> as SumcheckInstance<F, Blake2bTranscript>>::input_claim(&sumcheck))
+}
+
 fn timed_baseline<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64) {
-    let mut sumcheck = ProductSumcheck::from_polynomials(polys);
+    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Batch);
     let start = Instant::now();
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p,_c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
@@ -268,26 +281,26 @@ fn timed_baseline<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64) {
     (sumcheck.input_claim, elapsed)
 }
 
-fn timed_sliced_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64) {
-    let mut sumcheck = SlicedProductSumcheck::from_polynomials(polys);
+fn timed_streaming_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64) {
+    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Streaming);
     let start = Instant::now();
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p,_c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
     let elapsed = start.elapsed().as_secs_f64()*1000.0;
-    (sumcheck.base.input_claim, elapsed)
+    (sumcheck.input_claim, elapsed)
 }
 
 fn verify_latest<F: JoltField>(t: u32, d: u32) -> Result<(), Box<dyn std::error::Error>> {
     let polys = build_random_dense_polys::<F>(t, d, "fun");
     // Baseline
-    let mut base = ProductSumcheck::from_polynomials(polys.clone());
+    let mut base = ProductSumcheck::from_polynomials_mode(polys.clone(), ExecutionMode::Batch);
     let mut t1 = Blake2bTranscript::new(b"sumcheck_experiment");
     let (p1,_c1) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut base, None, &mut t1);
     let mut vt1 = Blake2bTranscript::new(b"sumcheck_experiment");
     let acc1 = Rc::new(RefCell::new(VerifierOpeningAccumulator::<F>::new()));
     SingleSumcheck::verify::<F, Blake2bTranscript>(&base, &p1, Some(acc1), &mut vt1)?;
-    // Sliced
-    let mut sliced = SlicedProductSumcheck::from_polynomials(polys);
+    // Streaming
+    let mut sliced = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Streaming);
     let mut t2 = Blake2bTranscript::new(b"sumcheck_experiment");
     let (p2,_c2) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sliced, None, &mut t2);
     let mut vt2 = Blake2bTranscript::new(b"sumcheck_experiment");

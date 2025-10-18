@@ -49,7 +49,6 @@ monitor = ["dep:sysinfo"]
 pprof = ["dep:pprof", "dep:prost"]
 test_incremental = []
 challenge-254-bit = []
-sumcheck_tile_cache = []
 
 [dependencies]
 ark-bn254.workspace = true
@@ -165,11 +164,6 @@ required-features = ["host"]
 [[bin]]
 name = "product_sumcheck"
 path = "src/bin/product_sumcheck.rs"
-required-features = ["host"]
-
-[[bin]]
-name = "sliced_product_sumcheck"
-path = "src/bin/sliced_product_sumcheck.rs"
 required-features = ["host"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
