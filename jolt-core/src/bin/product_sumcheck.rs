@@ -197,45 +197,23 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                     let mut evals_at_points = vec![F::zero(); points_len];
 
                     if let Some(r) = r_opt {
-                        // Phase 1: bind arrays once for the next round (parallel over polynomials), reusing buffer
-                        // Reuse previously allocated buffers for the bound arrays.
-                        // We avoid zero-initializing new vectors because we overwrite all entries.
-                        // In later rounds, the required length halves; we keep the underlying capacity
-                        // and simply update the logical `len` and `num_vars` so writes remain in-bounds
-                        // and no reallocation occurs.
+                        // Fused per-tile streaming: bind and evaluate locally, then write bound outputs for this tile.
+                        // Reuse previously allocated buffers for next_round arrays without zero-init.
                         let mut next_polys = s
                             .next_polys
                             .take()
                             .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect());
                         if next_polys.len() != num_polys {
-                            // Only happens if the degree changes across invocations; rebuild once.
                             next_polys = (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect();
                         }
                         for p in 0..num_polys {
                             if next_polys[p].len() != half_before {
-                                // Shrinking path dominates over time; do not shrink the backing Vec to avoid churn.
-                                // We only adjust the logical view; we will overwrite indices 0..half_before below.
                                 next_polys[p].len = half_before;
-                                // num_vars = log2(half_before); half_before is a power of two here.
                                 next_polys[p].num_vars = (usize::BITS as usize - 1) - half_before.leading_zeros() as usize;
                             }
                         }
 
-                        next_polys
-                            .par_iter_mut()
-                            .enumerate()
-                            .for_each(|(p_idx, dst)| {
-                                // Bind most-significant index bit to r once for this round, writing into the reused buffer.
-                                let src = &working[p_idx].Z;
-                                for j in 0..half_before {
-                                    let a = src[2 * j];
-                                    let b = src[2 * j + 1];
-                                    dst.Z[j] = a + r * (b - a);
-                                }
-                            });
-
-                        // Phase 2: evaluate reading bound arrays. We avoid per-tile heap allocations
-                        // by using a per-worker fold accumulator that carries the t-accumulator vectors.
+                        // We iterate tiles in units of j (bound indices), but compute pair contributions k using even-aligned bounds.
                         let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
@@ -243,23 +221,32 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                 |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
-                                    let start_even = start & !1;
-                                    let end_even = end & !1;
-                                    let k_start = start_even / 2;
-                                    let k_end = end_even / 2;
 
+                                    // 1) Bind locally into next buffer for this tile's j-range (disjoint writes per tile)
+                                    for p_idx in 0..num_polys {
+                                        let src = &working[p_idx].Z;
+                                        // SAFETY: Writes are to disjoint j ranges per tile; tiles do not overlap.
+                                        let dst_base = next_polys[p_idx].Z.as_ptr() as *mut F;
+                                        for j in start..end {
+                                            let a = src[2 * j];
+                                            let b = src[2 * j + 1];
+                                            let y = a + r * (b - a);
+                                            unsafe { dst_base.add(j).write(y); }
+                                        }
+                                    }
+
+                                    // 2) Evaluate contributions over pairs entirely within this tile
+                                    let k_start = (start + 1) >> 1; // first k with 2k >= start
+                                    let k_end = end >> 1;            // last k with 2k+1 < end
                                     for k in k_start..k_end {
-                                        // Product over polynomials for h(0)
                                         let mut prod_a = F::one();
-                                        for poly in next_polys.iter() {
-                                            let y0 = poly.Z[2 * k];
-                                            let y1 = poly.Z[2 * k + 1];
+                                        for p_idx in 0..num_polys {
+                                            let dst_base = next_polys[p_idx].Z.as_ptr() as *mut F;
+                                            let y0 = unsafe { dst_base.add(2 * k).read() };
+                                            let y1 = unsafe { dst_base.add(2 * k + 1).read() };
                                             let m2 = y1 - y0;
                                             prod_a = prod_a * y0;
                                             if t_len > 0 {
-                                                // Evaluate v_t = y0 + m2 * t for all t in a single pass using
-                                                // incremental updates (each step adds m2). This amortizes the cost
-                                                // across all t while the cache line is hot.
                                                 let mut v_t = y0 + m2 * t_vals[0];
                                                 prod_t_acc[0] = prod_t_acc[0] * v_t;
                                                 for idx in 1..t_len {
@@ -272,6 +259,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                         for idx in 0..t_len { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
                                         for v in &mut prod_t_acc { *v = F::one(); }
                                     }
+
                                     (h0_acc, ht_acc, prod_t_acc)
                                 },
                             )
