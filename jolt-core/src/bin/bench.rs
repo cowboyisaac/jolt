@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use ark_bn254::Fr;
 use std::time::Instant;
+use rayon::prelude::*;
 
 mod product_sumcheck;
 use jolt_core::field::JoltField;
@@ -8,8 +9,7 @@ use jolt_core::poly::dense_mlpoly::DensePolynomial;
 use jolt_core::subprotocols::sumcheck::{SingleSumcheck, SumcheckInstance};
 use jolt_core::transcripts::{Blake2bTranscript, Transcript};
 use product_sumcheck::{ProductSumcheck, ExecutionMode};
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
+// RNG imports removed; we use a custom splitmix64 for faster deterministic generation
 // verification for benches removed; covered by tests
 
 #[derive(Parser)]
@@ -91,31 +91,45 @@ fn main() {
 
 fn run_single_experiment(t: u32, d: u32, mode: u32, l1_kb: usize) {
     println!("Running sumcheck experiment: T={}, d={}, mode={}", t, d, mode);
-    // Only profile the proving time, not verification
-    let start = Instant::now();
-    let result = match mode {
-        0 => run_batch_sumcheck::<Fr>(t, d, l1_kb),
-        1 => run_streaming_sumcheck::<Fr>(t, d, l1_kb),
+    let total_start = Instant::now();
+    let gen_start = Instant::now();
+    let polys = build_random_dense_polys::<Fr>(t, d, "fun");
+    let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+    let (claim, prove_ms) = match mode {
+        0 => timed_batch::<Fr>(polys, l1_kb),
+        1 => timed_streaming_with_polys::<Fr>(polys, l1_kb),
         _ => {
             println!("Unknown mode {}, falling back to mode 0", mode);
-            run_batch_sumcheck::<Fr>(t, d, l1_kb)
+            timed_batch::<Fr>(build_random_dense_polys::<Fr>(t, d, "fun"), l1_kb)
         }
     };
-    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-    match result {
-        Ok(output) => println!("Completed in {:.2}ms, output: {}", duration_ms, output),
-        Err(e) => println!("Run failed: {}", e),
-    }
+    let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+    println!("Completed: total={:.2}ms, gen={:.2}ms, prove={:.2}ms, output={}", total_ms, gen_ms, prove_ms, claim);
 }
 
 fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("Comparing sumcheck implementations: T={}, d={}", t, d);
+    let overall_start = Instant::now();
+    let gen_start = Instant::now();
     let polys = build_random_dense_polys::<Fr>(t, d, "fun");
-    let (claim_batch, t_batch) = timed_batch::<Fr>(polys.clone(), l1_kb);
+    let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+
+    let clone_start = Instant::now();
+    let polys_clone = polys.clone();
+    let clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
+
+    let (claim_batch, t_batch) = timed_batch::<Fr>(polys_clone, l1_kb);
     let (claim_streaming, t_streaming) = timed_streaming_with_polys::<Fr>(polys, l1_kb);
+
+    let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
+    let accounted = gen_ms + clone_ms + t_batch + t_streaming;
+    let overhead_ms = (overall_ms - accounted).max(0.0);
+
     println!("Batch={:.2}ms, Streaming={:.2}ms, claim={} (equal: {})",
         t_batch, t_streaming, claim_batch, claim_batch == claim_streaming);
-    println!("Speedup (Batch/Streaming): {:.2}x", t_batch / t_streaming);
+    println!("Total={:.2}ms (gen={:.2}ms, clone={:.2}ms, batch={:.2}ms, streaming={:.2}ms, overhead={:.2}ms)",
+        overall_ms, gen_ms, clone_ms, t_batch, t_streaming, overhead_ms);
+    println!("Speedup (Batch/Streaming proving time ONLY): {:.2}x", t_batch / t_streaming);
     Ok(())
 }
 
@@ -144,17 +158,42 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, threads_list: Vec<u
 // ------------ Helpers moved from impl -------------
 
 fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<DensePolynomial<F>> {
+    // Deterministic, fast, parallel data generation using splitmix64-style mixing.
+    #[inline]
+    fn mix64(mut x: u64) -> u64 {
+        x = x.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
     let n = 1 << t;
     let degree = d as usize;
-    let mut polynomials = Vec::with_capacity(degree);
-    for poly_idx in 0..degree {
-        let mut coeffs = vec![F::zero(); n];
-        let poly_seed = seed.as_bytes().iter().map(|&b| b as u64).sum::<u64>() + poly_idx as u64;
-        let mut poly_rng = StdRng::seed_from_u64(poly_seed);
-        for i in 0..n { coeffs[i] = F::from_u64(poly_rng.gen_range(1..1000)); }
-        polynomials.push(DensePolynomial::new(coeffs));
-    }
-    polynomials
+    let base_seed = seed.as_bytes().iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64));
+
+    (0..degree)
+        .into_par_iter()
+        .map(|poly_idx| {
+            let mut coeffs = vec![F::zero(); n];
+            let poly_seed = base_seed.wrapping_add(poly_idx as u64);
+            // Fill in parallel chunks for better cache and parallelism on large n
+            coeffs
+                .par_chunks_mut(1024)
+                .enumerate()
+                .for_each(|(chunk_i, chunk)| {
+                    let start = chunk_i * 1024;
+                    for (off, c) in chunk.iter_mut().enumerate() {
+                        let i = start + off;
+                        let r = mix64(poly_seed ^ (i as u64).wrapping_mul(0x9E3779B185EBCA87));
+                        // Map to [1, 999]
+                        let val = 1 + (r % 999);
+                        *c = F::from_u64(val);
+                    }
+                });
+            DensePolynomial::new(coeffs)
+        })
+        .collect()
 }
 
 fn run_batch_sumcheck<F: JoltField>(t: u32, d: u32, l1_kb: usize) -> Result<F, Box<dyn std::error::Error>> {
