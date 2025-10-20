@@ -23,6 +23,10 @@ pub struct ProductSumcheck<F: JoltField> {
     pub degree: usize, // number of polynomials
     pub mode: ExecutionMode,
     pub tiling: Option<TilingState<F>>,
+    // Timings (ms)
+    pub input_claim_ms: f64,
+    pub boot_kernel_ms: f64,
+    pub recursive_kernel_ms: f64,
 }
 
 pub struct TilingState<F: JoltField> {
@@ -61,53 +65,20 @@ impl<F: JoltField> ProductSumcheck<F> {
         let log_n = if n == 0 { 0 } else { n.trailing_zeros() as usize };
         let degree = polynomials.len();
         let original_polynomials = polynomials.clone();
-        // Compute input_claim differently by mode for fair end-to-end benchmarking.
-        // - Batch: simple parallel map-reduce over i (no tiling), mirroring baseline behavior.
-        // - Tiling: partition-friendly tiled fold/reduce to minimize memory traffic.
+        // Compute input_claim using a simple parallel map-reduce over i (no tiling) for apples-to-apples.
         let l1_bytes_cfg = l1_kb.map(|kb| kb * 1024).unwrap_or(32 * 1024);
-        let (input_claim, _input_ms) = match mode {
-            ExecutionMode::Batch => {
-                let t0 = Instant::now();
-                let v = (0..n)
-                    .into_par_iter()
-                    .map(|i| polynomials.iter().fold(F::one(), |acc, poly| acc * poly.Z[i]))
-                    .reduce(|| F::zero(), |a, b| a + b);
-                (v, t0.elapsed().as_secs_f64() * 1000.0)
-            }
-            ExecutionMode::Tiling => {
-                let t0 = Instant::now();
-                let tile_len = TilingState::<F>::compute_tile_len(degree, l1_bytes_cfg);
-                let num_tiles = if n == 0 { 0 } else { (n + tile_len - 1) / tile_len };
-                let (sum_total, _scratch) = (0..num_tiles)
-                    .into_par_iter()
-                    .fold(
-                        || (F::zero(), F::one()),
-                        |(mut sum_acc, mut _tmp_prod), tile_idx| {
-                            let start = tile_idx * tile_len;
-                            let end = core::cmp::min(start + tile_len, n);
-                            for i in start..end {
-                                let mut prod = F::one();
-                                for poly in polynomials.iter() {
-                                    prod = prod * poly.Z[i];
-                                }
-                                sum_acc = sum_acc + prod;
-                            }
-                            (sum_acc, _tmp_prod)
-                        },
-                    )
-                    .reduce(
-                        || (F::zero(), F::one()),
-                        |(a_sum, _), (b_sum, _)| (a_sum + b_sum, F::one()),
-                    );
-                (sum_total, t0.elapsed().as_secs_f64() * 1000.0)
-            }
-        };
+        let input_t0 = Instant::now();
+        let input_claim = (0..n)
+            .into_par_iter()
+            .map(|i| polynomials.iter().fold(F::one(), |acc, poly| acc * poly.Z[i]))
+            .reduce(|| F::zero(), |a, b| a + b);
+        let input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
         let tiling = match mode {
             ExecutionMode::Batch => None,
             ExecutionMode::Tiling => Some(TilingState::new(degree, l1_bytes_cfg)),
         };
-        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling }
+        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling, input_claim_ms: input_ms, boot_kernel_ms: 0.0, recursive_kernel_ms: 0.0 }
     }
 }
 
@@ -116,8 +87,9 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
     fn num_rounds(&self) -> usize { self.log_n }
     fn input_claim(&self) -> F { self.input_claim }
 
-    fn compute_prover_message(&mut self, _round: usize, _previous_claim: F) -> Vec<F> {
-        match self.mode {
+    fn compute_prover_message(&mut self, round: usize, _previous_claim: F) -> Vec<F> {
+        let t0 = Instant::now();
+        let out = match self.mode {
             ExecutionMode::Batch => {
                 // Fused single-pass computation for h(0) and h(2..=degree) over j.
                 // We evaluate all t-values in one sweep while data are hot, avoiding (d-1) extra passes.
@@ -301,7 +273,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         s.next_polys = Some(old_polys);
                     } else {
                         // No binding yet (round 0): evaluate directly from current arrays using full-size pairs
-                        // in practise this will never happen, but we include it for completeness
                         let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
@@ -347,10 +318,14 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                     evals_at_points
                 }
             }
-        }
+        };
+        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+        if round == 0 { self.boot_kernel_ms += dt; } else { self.recursive_kernel_ms += dt; }
+        out
     }
 
     fn bind(&mut self, r_j: F::Challenge, _round: usize) {
+        let t0 = Instant::now();
         match self.mode {
             ExecutionMode::Batch => {
                 self.polynomials.par_iter_mut().for_each(|poly| {
@@ -361,6 +336,9 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                 if let Some(ref mut s) = self.tiling { s.pending_r = Some(r_j); }
             }
         }
+        // Count bind cost as part of recursive kernel timing (bind happens after boot round)
+        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+        self.recursive_kernel_ms += dt;
     }
 
     fn expected_output_claim(

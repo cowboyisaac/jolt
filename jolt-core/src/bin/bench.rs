@@ -111,7 +111,7 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, l1_kb: usize) {
     let gen_start = Instant::now();
     let polys = build_random_dense_polys::<Fr>(t, d, "fun");
     let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-    let (claim, total_proving_ms, input_ms, compute_ms) = match mode {
+    let (claim, total_proving_ms, boot_ms, recur_ms, input_ms) = match mode {
         0 => timed_batch::<Fr>(polys, l1_kb),
         1 => timed_tiling_with_polys::<Fr>(polys, l1_kb),
         _ => {
@@ -129,8 +129,8 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, l1_kb: usize) {
         0.0
     };
     println!(
-        "Completed: total={:.2}ms, gen={:.2}ms, first_sum={:.2}ms, prove={:.2}ms, total_proving={:.2}ms, threads={}, per_thread_speed={:.0} elems, throughput_per_thread={:.2} elems/s, output={}",
-        total_ms, gen_ms, input_ms, compute_ms, input_ms + compute_ms, threads, per_thread_speed, throughput, claim
+        "Completed: total={:.2}ms, gen={:.2}ms, input_claim={:.2}ms, boot-kernel={:.2}ms, recursive-kernel={:.2}ms, total_proving={:.2}ms, threads={}, per_thread_speed={:.0} elems, throughput_per_thread={:.2} elems/s, output={}",
+        total_ms, gen_ms, input_ms, boot_ms, recur_ms, total_proving_ms, threads, per_thread_speed, throughput, claim
     );
 }
 
@@ -145,8 +145,8 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
     let polys_clone = polys.clone();
     let clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
 
-    let (claim_batch, t_batch, first_sum_batch_ms, prove_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
-    let (claim_tiling, t_tiling, first_sum_tiling_ms, prove_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
+    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
+    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
 
     let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     let accounted = gen_ms + clone_ms + t_batch + t_tiling;
@@ -157,19 +157,19 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
 
     // Print Batch timings
     println!(
-        "Batch: total={:.2}ms (first_sum={:.2}ms, prove={:.2}ms), claim={} (equal to tiling: {})",
-        t_batch, first_sum_batch_ms, prove_batch_ms, claim_batch, claim_batch == claim_tiling
+        "Batch: total={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms), claim={} (equal to tiling: {})",
+        t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, claim_batch, claim_batch == claim_tiling
     );
 
     // Print Tiling timings on a separate line for clarity
     println!(
-        "Tiling: total={:.2}ms (first_sum={:.2}ms, prove={:.2}ms)",
-        t_tiling, first_sum_tiling_ms, prove_tiling_ms,
+        "Tiling: total={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms)",
+        t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms,
     );
 
-    // Extra clarification for first_sum
-    if first_sum_batch_ms == 0.0 && first_sum_tiling_ms == 0.0 {
-        println!("Note: first_sum=0.00ms indicates that the sum of the polynomial(s) over the hypercube was either negligible (optimized away) or too fast to measure precisely for this size.");
+    // Extra clarification for input_claim
+    if input_batch_ms == 0.0 && input_tiling_ms == 0.0 {
+        println!("Note: input_claim=0.00ms indicates the sum was negligible or too fast to measure precisely for this size.");
     }
 
     println!("Threads Used: {}", threads);
@@ -177,8 +177,8 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
         "Total={:.2}ms (gen={:.2}ms, clone={:.2}ms, batch={:.2}ms, tiling={:.2}ms, overhead={:.2}ms)",
         overall_ms, gen_ms, clone_ms, t_batch, t_tiling, overhead_ms
     );
-    let total_batch_ms = first_sum_batch_ms + prove_batch_ms;
-    let total_tiling_ms = first_sum_tiling_ms + prove_tiling_ms;
+    let total_batch_ms = boot_batch_ms + recur_batch_ms;
+    let total_tiling_ms = boot_tiling_ms + recur_tiling_ms;
     let throughput_batch = if total_batch_ms > 0.0 {
         total_elems as f64 / threads as f64 / (total_batch_ms / 1000.0)
     } else {
@@ -201,7 +201,7 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
 fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_path: String, threads: Option<Vec<usize>>) {
     let thread_variants: Vec<usize> = if let Some(v) = threads { if v.is_empty() { vec![rayon::current_num_threads()] } else { v } } else { vec![rayon::current_num_threads()] };
     println!("Batch experiments: Ts={:?}, ds={:?}, threads={:?}", t_list, d_list, thread_variants);
-    let mut rows: Vec<(u32, u32, usize, f64, f64, f64, f64, usize, f64, f64, f64, f64)> = Vec::new();
+    let mut rows: Vec<(u32, u32, usize, f64, f64, f64, f64, usize, f64, f64, f64, f64, f64, f64)> = Vec::new();
     for &thr in &thread_variants {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(thr).build().expect("build thread pool");
         pool.install(|| {
@@ -214,18 +214,18 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
                     let clone_start = Instant::now();
                     let polys_clone = polys.clone();
                     let _clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
-                    let (claim_batch, t_batch, first_sum_batch_ms, prove_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
-                    let (claim_tiling, t_tiling, first_sum_tiling_ms, prove_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
+                    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
+                    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
                     let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
                     let threads_here = rayon::current_num_threads();
-                    let total_proving_batch = first_sum_batch_ms + prove_batch_ms;
-                    let total_proving_tiling = first_sum_tiling_ms + prove_tiling_ms;
+                    let total_proving_batch = boot_batch_ms + recur_batch_ms;
+                    let total_proving_tiling = boot_tiling_ms + recur_tiling_ms;
                     let _speedup = if total_proving_tiling > 0.0 { total_proving_batch / total_proving_tiling } else { 0.0 };
                     println!(
-                        "T={}, d={}, threads={}, batch={:.2}ms (first_sum={:.2}ms, prove={:.2}ms), tiling={:.2}ms (first_sum={:.2}ms, prove={:.2}ms), total={:.2}ms, equal={}",
-                        t, d, threads_here, t_batch, first_sum_batch_ms, prove_batch_ms, t_tiling, first_sum_tiling_ms, prove_tiling_ms, overall_ms, claim_batch == claim_tiling
+                        "T={}, d={}, threads={}, batch={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms), tiling={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms), total={:.2}ms, equal={}",
+                        t, d, threads_here, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms, overall_ms, claim_batch == claim_tiling
                     );
-                    rows.push((t, d, threads_here, gen_ms, t_batch, t_tiling, overall_ms, threads_here, first_sum_batch_ms, prove_batch_ms, first_sum_tiling_ms, prove_tiling_ms));
+                    rows.push((t, d, threads_here, gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
                 }
             }
         });
@@ -261,7 +261,7 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
             let mut series_batch_prove: Vec<(i32, f64)> = Vec::new();
             let mut series_tiling_first: Vec<(i32, f64)> = Vec::new();
             let mut series_tiling_prove: Vec<(i32, f64)> = Vec::new();
-            for &(t, dd, threads_here, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct) in rows.iter() {
+            for &(t, dd, threads_here, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct, _ibatch, _itiling) in rows.iter() {
                 if dd == d && threads_here == thr {
                     series_batch_first.push((t as i32, ib));
                     series_batch_prove.push((t as i32, cb));
@@ -272,25 +272,25 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
             chart
                 .draw_series(LineSeries::new(series_batch_first, &RED))
                 .unwrap()
-                .label(format!("batch first_sum d={} thr={}", d, thr))
+                .label(format!("batch boot-kernel d={} thr={}", d, thr))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
 
             chart
                 .draw_series(LineSeries::new(series_batch_prove, &GREEN))
                 .unwrap()
-                .label(format!("batch prove d={} thr={}", d, thr))
+                .label(format!("batch recursive-kernel d={} thr={}", d, thr))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
 
             chart
                 .draw_series(LineSeries::new(series_tiling_first, &BLUE))
                 .unwrap()
-                .label(format!("tiling first_sum d={} thr={}", d, thr))
+                .label(format!("tiling boot-kernel d={} thr={}", d, thr))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
 
             chart
                 .draw_series(LineSeries::new(series_tiling_prove, &MAGENTA))
                 .unwrap()
-                .label(format!("tiling prove d={} thr={}", d, thr))
+                .label(format!("tiling recursive-kernel d={} thr={}", d, thr))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
         }
     }
@@ -302,7 +302,7 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
         .unwrap();
 
     root.present().unwrap();
-    println!("Wrote chart: {}", out_path);
+    println!("Output chart: {}", out_path);
 
     // Chart 2: by threads (x-axis threads), one chart per d with all T values overlaid by phase
     let out_threads = std::path::Path::new(&out_path)
@@ -336,7 +336,7 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
             let mut b_prove: Vec<(i32, f64)> = Vec::new();
             let mut t_first: Vec<(i32, f64)> = Vec::new();
             let mut t_prove: Vec<(i32, f64)> = Vec::new();
-            for &(tt, dd, threads_here, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct) in rows.iter() {
+            for &(tt, dd, threads_here, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct, _ibatch, _itiling) in rows.iter() {
                 if dd == d && tt == t {
                     b_first.push((threads_here as i32, ib));
                     b_prove.push((threads_here as i32, cb));
@@ -345,16 +345,16 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
                 }
             }
             chart2.draw_series(LineSeries::new(b_first, &RED)).unwrap()
-                .label(format!("batch first_sum d={} T={}", d, t))
+                .label(format!("batch boot-kernel d={} T={}", d, t))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
             chart2.draw_series(LineSeries::new(b_prove, &GREEN)).unwrap()
-                .label(format!("batch prove d={} T={}", d, t))
+                .label(format!("batch recursive-kernel d={} T={}", d, t))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
             chart2.draw_series(LineSeries::new(t_first, &BLUE)).unwrap()
-                .label(format!("tiling first_sum d={} T={}", d, t))
+                .label(format!("tiling boot-kernel d={} T={}", d, t))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
             chart2.draw_series(LineSeries::new(t_prove, &MAGENTA)).unwrap()
-                .label(format!("tiling prove d={} T={}", d, t))
+                .label(format!("tiling recursive-kernel d={} T={}", d, t))
                 .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
         }
     }
@@ -424,36 +424,22 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
 // Presume they should return input_ms and compute_ms as f64
 // Adjust the helpers accordingly so calling sites work.
 
-fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64) {
+fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64, f64) {
     let start = Instant::now();
-    // In batch mode, input_claim is computed with a parallel map-reduce over i (as in compare mode).
-    // Here we time the input_claim computation to match Compare mode for consistent reporting.
-    let compute_start = Instant::now();
     let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Batch, Some(l1_kb));
-    let first_sum = sumcheck.input_claim;
-    let input_ms = compute_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
-    let prove_start = Instant::now();
     let (_p, _c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
-    let prove_ms = prove_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    (first_sum, total_ms, input_ms, prove_ms)
+    (sumcheck.input_claim, total_ms, sumcheck.boot_kernel_ms, sumcheck.recursive_kernel_ms, sumcheck.input_claim_ms)
 }
 
-fn timed_tiling_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64) {
+fn timed_tiling_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64, f64) {
     let start = Instant::now();
-    let constructor_start = Instant::now();
     let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Tiling, Some(l1_kb));
-    let first_sum_ms = constructor_start.elapsed().as_secs_f64() * 1000.0; // first_sum time = constructor time
 
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
-    let first_sum = sumcheck.input_claim;
-    let prove_start = Instant::now();
     let (_p, _c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
-    let prove_ms = prove_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    (first_sum, total_ms, first_sum_ms, prove_ms)
+    (sumcheck.input_claim, total_ms, sumcheck.boot_kernel_ms, sumcheck.recursive_kernel_ms, sumcheck.input_claim_ms)
 }
