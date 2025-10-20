@@ -145,8 +145,8 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
     let polys_clone = polys.clone();
     let clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
 
-    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
-    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
+    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, _input_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
+    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, _input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
 
     let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     let accounted = gen_ms + clone_ms + t_batch + t_tiling;
@@ -155,27 +155,19 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
     let threads = rayon::current_num_threads();
     let total_elems = (1u128 << t) * (d as u128);
 
-    // Print Batch timings
-    println!(
-        "Batch: total={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms), claim={} (equal to tiling: {})",
-        t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, claim_batch, claim_batch == claim_tiling
-    );
-
-    // Print Tiling timings on a separate line for clarity
-    println!(
-        "Tiling: total={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms)",
-        t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms,
-    );
-
-    // Extra clarification for input_claim
-    if input_batch_ms == 0.0 && input_tiling_ms == 0.0 {
-        println!("Note: input_claim=0.00ms indicates the sum was negligible or too fast to measure precisely for this size.");
-    }
-
     println!("Threads Used: {}", threads);
+    println!("Results:");
     println!(
-        "Total={:.2}ms (gen={:.2}ms, clone={:.2}ms, batch={:.2}ms, tiling={:.2}ms, overhead={:.2}ms)",
-        overall_ms, gen_ms, clone_ms, t_batch, t_tiling, overhead_ms
+        "  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | claim={} | equal={}",
+        t_batch, boot_batch_ms, recur_batch_ms, claim_batch, claim_batch == claim_tiling
+    );
+    println!(
+        "  Tiling: total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms",
+        t_tiling, boot_tiling_ms, recur_tiling_ms,
+    );
+    println!(
+        "  Time breakdown: gen={:.2}ms | clone={:.2}ms | overhead={:.2}ms",
+        gen_ms, clone_ms, overhead_ms
     );
     let total_batch_ms = boot_batch_ms + recur_batch_ms;
     let total_tiling_ms = boot_tiling_ms + recur_tiling_ms;
@@ -190,11 +182,11 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
         0.0
     };
     println!(
-        "Throughput per thread: batch={:.2} elems/s, tiling={:.2} elems/s",
+        "  Throughput per thread: batch={:.2} elems/s | tiling={:.2} elems/s",
         throughput_batch, throughput_tiling
     );
     let speedup = if t_tiling > 0.0 { t_batch / t_tiling } else { 0.0 };
-    println!("Speedup (Batch/Tiling): {:.2}x", speedup);
+    println!("  Speedup (Batch/Tiling): {:.2}x", speedup);
     Ok(())
 }
 
@@ -222,8 +214,10 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
                     let total_proving_tiling = boot_tiling_ms + recur_tiling_ms;
                     let _speedup = if total_proving_tiling > 0.0 { total_proving_batch / total_proving_tiling } else { 0.0 };
                     println!(
-                        "T={}, d={}, threads={}, batch={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms), tiling={:.2}ms (boot-kernel={:.2}ms, recursive-kernel={:.2}ms, input_claim={:.2}ms), total={:.2}ms, equal={}",
-                        t, d, threads_here, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms, overall_ms, claim_batch == claim_tiling
+                        "T={}, d={}, threads={}:\n  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling: total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | total(all)={:.2}ms",
+                        t, d, threads_here,
+                        t_batch, boot_batch_ms, recur_batch_ms, claim_batch == claim_tiling,
+                        t_tiling, boot_tiling_ms, recur_tiling_ms, overall_ms
                     );
                     rows.push((t, d, threads_here, gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
                 }
