@@ -171,6 +171,9 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
     let n = 1 << t;
     let degree = d as usize;
     let base_seed = seed.as_bytes().iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64));
+    // Small coefficient range to reduce conversion overhead and improve cache behavior.
+    // Precompute a tiny lookup table once per call.
+    let coeff_table: Vec<F> = (0u64..=16u64).map(|v| F::from_u64(v)).collect();
 
     (0..degree)
         .into_par_iter()
@@ -186,9 +189,10 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
                     for (off, c) in chunk.iter_mut().enumerate() {
                         let i = start + off;
                         let r = mix64(poly_seed ^ (i as u64).wrapping_mul(0x9E3779B185EBCA87));
-                        // Map to [1, 999]
-                        let val = 1 + (r % 999);
-                        *c = F::from_u64(val);
+                        // Map to [1, 16] using low 4 bits
+                        let val = 1 + ((r & 0xF) as u64);
+                        // Safe index into small LUT
+                        *c = coeff_table[val as usize];
                     }
                 });
             DensePolynomial::new(coeffs)
