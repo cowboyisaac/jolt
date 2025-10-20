@@ -170,14 +170,13 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                     let mut evals_at_points = vec![F::zero(); points_len];
 
                     if let Some(r) = r_opt {
-                        // Bandwidth-first two-phase execution to maximize effective memory throughput:
-                        // Phase A (global): for each polynomial, stream through the entire current array to
-                        // compute and write bound outputs y[j] contiguously into next_polys[p].Z. This preserves
-                        // long, contiguous bursts per array (great for hardware prefetch and NUMA bandwidth).
-                        // Phase B (tiled accumulation): iterate tiles to read the freshly written y values and
-                        // accumulate h(0) and h(t). This keeps the working set small during accumulation without
-                        // interleaving per-poly writes, which can degrade bandwidth.
-                        // Reuse previously allocated buffers for next_round arrays without zero-init.
+                        // Tile-local scratch strategy:
+                        // - For each tile: compute y[j] into a tile-local buffer per polynomial
+                        // - Use the buffers to accumulate h(0) and h(t) within the tile
+                        // - Commit the tile buffers to the next round arrays in one contiguous write per polynomial
+                        // This preserves fused bind+eval while improving locality and write coalescing.
+
+                        // Prepare next_round destination containers (reused across rounds)
                         let mut next_polys = s
                             .next_polys
                             .take()
@@ -192,76 +191,79 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                             }
                         }
 
-                        // Phase A: global per-polynomial binding pass with contiguous writes
-                        next_polys
-                            .par_iter_mut()
-                            .enumerate()
-                            .for_each(|(p_idx, dst_poly)| {
-                                let src = &working[p_idx].Z;
-                                let dst = &mut dst_poly.Z;
-                                dst[..half_before]
-                                    .par_chunks_mut(1024)
-                                    .enumerate()
-                                    .for_each(|(chunk_i, chunk)| {
-                                        let start = chunk_i * 1024;
-                                        for (off, y_slot) in chunk.iter_mut().enumerate() {
-                                            let j = start + off;
-                                            if j >= half_before { break; }
-                                            let a = src[2 * j];
-                                            let b = src[2 * j + 1];
-                                            let m = b - a;
-                                            *y_slot = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
-                                        }
-                                    });
-                            });
-
-                        // We iterate tiles in units of j (bound indices), but compute pair contributions k using even-aligned bounds.
-                        let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
+                        // Parallel tiles with per-worker scratch; contiguous commit per tile
+                        let (h0_total, ht_total, _scratch) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
-                                |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
+                                || {
+                                    let h0 = F::zero();
+                                    let ht = vec![F::zero(); t_len];
+                                    // One reusable y buffer per polynomial sized to tile_len
+                                    let y_scratch: Vec<Vec<F>> = (0..num_polys)
+                                        .map(|_| vec![F::zero(); s.tile_len])
+                                        .collect();
+                                    (h0, ht, y_scratch)
+                                },
+                                |(mut h0_acc, mut ht_acc, mut y_scratch), tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
-
-                                    // Phase B: accumulate h(0) and h(t) over pairs fully contained in this tile.
-                                    // We only take k such that j0=2k and j1=2k+1 both fall within [start, end),
-                                    // which is guaranteed for power-of-two tile sizes.
-                                    let k_start = (start + 1) >> 1; // first k with 2k >= start
-                                    let k_end = end >> 1;            // last k with 2k+1 < end
-                                    for k in k_start..k_end {
-                                        let j0 = 2 * k;
-                                        let j1 = 2 * k + 1;
-
-                                        // Product across polynomials for h(0) and vectorized v_t accumulation
-                                        let mut prod_a = F::one();
+                                    if start < end {
+                                        let cur_len = end - start;
+                                        // Compute y into scratch buffers
                                         for p_idx in 0..num_polys {
-                                            let y0 = next_polys[p_idx].Z[j0];
-                                            let y1 = next_polys[p_idx].Z[j1];
-                                            let m2 = y1 - y0;
-                                            prod_a = prod_a * y0;
-                                            if t_len > 0 {
-                                                let mut v_t = y0 + m2 * t_vals[0];
-                                                prod_t_acc[0] = prod_t_acc[0] * v_t;
-                                                for idx in 1..t_len {
-                                                    v_t = v_t + m2;
-                                                    prod_t_acc[idx] = prod_t_acc[idx] * v_t;
-                                                }
+                                            let src = &working[p_idx].Z;
+                                            let buf = &mut y_scratch[p_idx];
+                                            for off in 0..cur_len {
+                                                let j = start + off;
+                                                let a = src[2 * j];
+                                                let b = src[2 * j + 1];
+                                                let m = b - a;
+                                                buf[off] = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
                                             }
                                         }
-                                        h0_acc = h0_acc + prod_a;
-                                        for idx in 0..t_len { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
-                                        for v in &mut prod_t_acc { *v = F::one(); }
+                                        // Accumulate h within this tile
+                                        let k_start = (start + 1) >> 1;
+                                        let k_end = end >> 1;
+                                        let mut prod_t_acc = vec![F::one(); t_len];
+                                        for k in k_start..k_end {
+                                            let j0 = 2 * k;
+                                            let j1 = 2 * k + 1;
+                                            let o0 = j0 - start;
+                                            let o1 = j1 - start;
+                                            let mut prod_a = F::one();
+                                            for p_idx in 0..num_polys {
+                                                let y0 = y_scratch[p_idx][o0];
+                                                let y1 = y_scratch[p_idx][o1];
+                                                let m2 = y1 - y0;
+                                                prod_a = prod_a * y0;
+                                                if t_len > 0 {
+                                                    let mut v_t = y0 + m2 * t_vals[0];
+                                                    prod_t_acc[0] = prod_t_acc[0] * v_t;
+                                                    for idx in 1..t_len {
+                                                        v_t = v_t + m2;
+                                                        prod_t_acc[idx] = prod_t_acc[idx] * v_t;
+                                                    }
+                                                }
+                                            }
+                                            h0_acc = h0_acc + prod_a;
+                                            for idx in 0..t_len { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                                            for v in &mut prod_t_acc { *v = F::one(); }
+                                        }
+                                        // Commit tile buffers to next round arrays (single contiguous copy per polynomial)
+                                        for p_idx in 0..num_polys {
+                                            let dst_base = next_polys[p_idx].Z.as_ptr() as *mut F;
+                                            let src_ptr = y_scratch[p_idx].as_ptr();
+                                            unsafe { std::ptr::copy_nonoverlapping(src_ptr, dst_base.add(start), cur_len); }
+                                        }
                                     }
-
-                                    (h0_acc, ht_acc, prod_t_acc)
+                                    (h0_acc, ht_acc, y_scratch)
                                 },
                             )
                             .reduce(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                                || (F::zero(), vec![F::zero(); t_len], vec![Vec::<F>::new(); num_polys]),
                                 |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
                                     for i in 0..t_len { ht_a[i] = ht_a[i] + ht_b[i]; }
-                                    (h0_a + h0_b, ht_a, vec![F::one(); t_len])
+                                    (h0_a + h0_b, ht_a, vec![Vec::<F>::new(); num_polys])
                                 },
                             );
 
