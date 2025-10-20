@@ -332,18 +332,20 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
 
 fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64) {
     let start = Instant::now();
-    let constructor_start = Instant::now();
+    // In batch mode, input_claim is computed with a parallel map-reduce over i (as in compare mode).
+    // Here we time the input_claim computation to match Compare mode for consistent reporting.
+    let compute_start = Instant::now();
     let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Batch, Some(l1_kb));
-    let first_sum_ms = constructor_start.elapsed().as_secs_f64() * 1000.0; // first_sum time = constructor time
+    let first_sum = sumcheck.input_claim;
+    let input_ms = compute_start.elapsed().as_secs_f64() * 1000.0;
 
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
-    let first_sum = sumcheck.input_claim;
     let prove_start = Instant::now();
     let (_p, _c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
     let prove_ms = prove_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    (first_sum, total_ms, first_sum_ms, prove_ms)
+    (first_sum, total_ms, input_ms, prove_ms)
 }
 
 fn timed_tiling_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64) {

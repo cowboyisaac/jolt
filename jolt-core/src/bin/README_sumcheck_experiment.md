@@ -5,15 +5,15 @@ A command-line tool for experimenting with different sumcheck implementations us
 ## Usage
 
 ```bash
-# Run from the jolt root directory
-cargo run -p jolt-core --bin bench -- [COMMAND] [OPTIONS]
+# Run from the jolt root directory, always in release mode!
+cargo run --release -p jolt-core --bin bench -- [COMMAND] [OPTIONS]
 ```
 
 ## Commands
 
 ### Run Single Experiment
 ```bash
-cargo run -p jolt-core --bin bench -- run --T 10 --d 2 --mode 0 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- run --T 10 --d 2 --mode 0 --l1-kb 64
 ```
 
 **Options:**
@@ -25,7 +25,7 @@ Threads are auto-managed by rayon; the `--threads` flag is deprecated.
 
 ### Compare Implementations
 ```bash
-cargo run -p jolt-core --bin bench -- compare --T 10 --d 2 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- compare --T 10 --d 2 --l1-kb 64
 ```
 
 **Options:**
@@ -37,7 +37,7 @@ Threads are auto-managed by rayon; the `--threads` flag is deprecated.
 ### Batch Experiments
 Run a grid of experiments over T and d:
 ```bash
-cargo run -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --l1-kb 64
 ```
 
 ## Modes
@@ -96,11 +96,11 @@ This makes the experiments highly credible and representative of actual Jolt sum
 ## Examples
 ```bash
 # Single run
-cargo run -p jolt-core --bin bench -- run --T 18 --d 3 --mode 0 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- run --T 18 --d 3 --mode 0 --l1-kb 64
 
 # Compare batch vs streaming for a single setting
-cargo run -p jolt-core --bin bench -- compare --T 24 --d 2 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- compare --T 24 --d 2 --l1-kb 64
 
 # Batch grid
-cargo run -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --l1-kb 64
 ```
