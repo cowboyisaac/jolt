@@ -43,7 +43,7 @@ cargo run -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --l1-kb 64
 ## Modes
 
 - **Mode 0 - Batch**: Uses `SingleSumcheck` with `ProductSumcheck` in batch mode; input_claim uses a parallel map-reduce over i (no tiling), mirroring baseline behavior.
-- **Mode 1 - Streaming**: Uses `SingleSumcheck` with `ProductSumcheck` in streaming mode; input_claim uses a partition-friendly tiled fold/reduce with tile_len derived from `--l1-kb`.
+- **Mode 1 - Tiling**: Uses `SingleSumcheck` with `ProductSumcheck` in tiling mode; input_claim uses a partition-friendly tiled fold/reduce with tile_len derived from `--l1-kb`.
 
 ## Implementation Details
 
@@ -66,7 +66,7 @@ The tool uses deterministic pseudo-random data generation with seed "fun":
 
 ## Tiling and L1 sizing
 
-- Streaming uses tiled evaluation to improve cache locality. Tile length is derived from the configured L1 size:
+- Tiling uses tiled evaluation to improve cache locality. Tile length is derived from the configured L1 size:
   - `tile_len ≈ L1_bytes / (degree * elem_bytes)`, clamped to [64, 1024] and rounded to a power of two.
   - `--l1-kb` sets L1_bytes = KB * 1024; default is 32 KiB.
   - Deferred binding: bind() records the next challenge; at the start of compute, the instance applies the pending challenge to produce halved polynomials, then computes the product-sum evaluations.
@@ -99,7 +99,7 @@ This makes the experiments highly credible and representative of actual Jolt sum
 cargo run -p jolt-core --bin bench -- run --T 18 --d 3 --mode 0 --l1-kb 64
 
 # Compare batch vs streaming for a single setting
-cargo run -p jolt-core --bin bench -- compare --T 15 --d 2 --l1-kb 64
+cargo run -p jolt-core --bin bench -- compare --T 24 --d 2 --l1-kb 64
 
 # Batch grid
 cargo run -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --l1-kb 64

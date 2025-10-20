@@ -7,11 +7,12 @@ use jolt_core::transcripts::Transcript;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 // Product sumcheck over d multilinear polynomials
 pub enum ExecutionMode {
     Batch,
-    Streaming,
+    Tiling,
 }
 
 pub struct ProductSumcheck<F: JoltField> {
@@ -21,20 +22,19 @@ pub struct ProductSumcheck<F: JoltField> {
     pub log_n: usize,
     pub degree: usize, // number of polynomials
     pub mode: ExecutionMode,
-    pub streaming: Option<StreamingState<F>>,
+    pub tiling: Option<TilingState<F>>,
+    pub metrics: SumcheckMetrics,
 }
 
-pub struct StreamingState<F: JoltField> {
+pub struct TilingState<F: JoltField> {
     pub tile_len: usize,
     pub pending_r: Option<F::Challenge>,
     pub t_vals: Vec<F>,
     // Reusable buffer for next-round bound polynomials to avoid reallocations
     pub next_polys: Option<Vec<DensePolynomial<F>>>,
-    // Configured L1 size (bytes) used for tile sizing. Defaulted if not provided.
-    pub l1_bytes: usize,
 }
 
-impl<F: JoltField> StreamingState<F> {
+impl<F: JoltField> TilingState<F> {
     fn compute_tile_len(degree: usize, l1_bytes: usize) -> usize {
         let elem_bytes: usize = core::mem::size_of::<F>().max(32); // BN254 ~32 bytes
         let d = degree.max(1);
@@ -52,7 +52,6 @@ impl<F: JoltField> StreamingState<F> {
             pending_r: None,
             t_vals,
             next_polys: None,
-            l1_bytes,
         }
     }
 }
@@ -65,17 +64,20 @@ impl<F: JoltField> ProductSumcheck<F> {
         let original_polynomials = polynomials.clone();
         // Compute input_claim differently by mode for fair end-to-end benchmarking.
         // - Batch: simple parallel map-reduce over i (no tiling), mirroring baseline behavior.
-        // - Streaming: partition-friendly tiled fold/reduce to minimize memory traffic.
+        // - Tiling: partition-friendly tiled fold/reduce to minimize memory traffic.
         let l1_bytes_cfg = l1_kb.map(|kb| kb * 1024).unwrap_or(32 * 1024);
-        let input_claim = match mode {
+        let (input_claim, input_ms) = match mode {
             ExecutionMode::Batch => {
-                (0..n)
+                let t0 = Instant::now();
+                let v = (0..n)
                     .into_par_iter()
                     .map(|i| polynomials.iter().fold(F::one(), |acc, poly| acc * poly.Z[i]))
-                    .reduce(|| F::zero(), |a, b| a + b)
+                    .reduce(|| F::zero(), |a, b| a + b);
+                (v, t0.elapsed().as_secs_f64() * 1000.0)
             }
-            ExecutionMode::Streaming => {
-                let tile_len = StreamingState::<F>::compute_tile_len(degree, l1_bytes_cfg);
+            ExecutionMode::Tiling => {
+                let t0 = Instant::now();
+                let tile_len = TilingState::<F>::compute_tile_len(degree, l1_bytes_cfg);
                 let num_tiles = if n == 0 { 0 } else { (n + tile_len - 1) / tile_len };
                 let (sum_total, _scratch) = (0..num_tiles)
                     .into_par_iter()
@@ -98,15 +100,15 @@ impl<F: JoltField> ProductSumcheck<F> {
                         || (F::zero(), F::one()),
                         |(a_sum, _), (b_sum, _)| (a_sum + b_sum, F::one()),
                     );
-                sum_total
+                (sum_total, t0.elapsed().as_secs_f64() * 1000.0)
             }
         };
 
-        let streaming = match mode {
+        let tiling = match mode {
             ExecutionMode::Batch => None,
-            ExecutionMode::Streaming => Some(StreamingState::new(degree, l1_bytes_cfg)),
+            ExecutionMode::Tiling => Some(TilingState::new(degree, l1_bytes_cfg)),
         };
-        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, streaming }
+        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling, metrics: SumcheckMetrics { input_claim_ms: input_ms, compute_ms: 0.0 } }
     }
 }
 
@@ -116,6 +118,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
     fn input_claim(&self) -> F { self.input_claim }
 
     fn compute_prover_message(&mut self, _round: usize, _previous_claim: F) -> Vec<F> {
+        let t0 = Instant::now();
         match self.mode {
             ExecutionMode::Batch => {
                 // Fused single-pass computation for h(0) and h(2..=degree) over j.
@@ -168,12 +171,14 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                 let mut evals_at_points = vec![F::zero(); points_len];
                 evals_at_points[0] = h0_total;
                 for idx in 0..t_len { evals_at_points[idx + 1] = ht_total[idx]; }
-                evals_at_points
+                let out = evals_at_points;
+                self.metrics.compute_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                out
             }
-            ExecutionMode::Streaming => {
+            ExecutionMode::Tiling => {
                 {
                     let this = &mut *self;
-                    let s = this.streaming.as_mut().expect("streaming state expected");
+                    let s = this.tiling.as_mut().expect("tiling state expected");
                     let r_opt = s.pending_r.take();
 
                     // Working view for this round
@@ -322,7 +327,9 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         for idx in 0..ht_total.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht_total[idx]; }
                     }
 
-                    evals_at_points
+                    let out = evals_at_points;
+                    this.metrics.compute_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                    out
                 }
             }
         }
@@ -335,8 +342,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                     poly.bind_parallel(r_j, BindingOrder::LowToHigh);
                 });
             }
-            ExecutionMode::Streaming => {
-                if let Some(ref mut s) = self.streaming { s.pending_r = Some(r_j); }
+            ExecutionMode::Tiling => {
+                if let Some(ref mut s) = self.tiling { s.pending_r = Some(r_j); }
             }
         }
     }
@@ -379,8 +386,12 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
 }
 
 // Streaming executor implementation folded into ProductSumcheck
-impl<F: JoltField> ProductSumcheck<F> {
-    
+impl<F: JoltField> ProductSumcheck<F> {}
+
+#[derive(Default, Clone)]
+pub struct SumcheckMetrics {
+    pub input_claim_ms: f64,
+    pub compute_ms: f64,
 }
 
 #[cfg(test)]
@@ -439,9 +450,9 @@ mod tests {
         run_product_sumcheck_test(2, ExecutionMode::Batch);
         run_product_sumcheck_test(3, ExecutionMode::Batch);
         run_product_sumcheck_test(4, ExecutionMode::Batch);
-        run_product_sumcheck_test(2, ExecutionMode::Streaming);
-        run_product_sumcheck_test(3, ExecutionMode::Streaming);
-        run_product_sumcheck_test(4, ExecutionMode::Streaming);
+        run_product_sumcheck_test(2, ExecutionMode::Tiling);
+        run_product_sumcheck_test(3, ExecutionMode::Tiling);
+        run_product_sumcheck_test(4, ExecutionMode::Tiling);
     }
 
 }
