@@ -30,11 +30,12 @@ pub struct StreamingState<F: JoltField> {
     pub t_vals: Vec<F>,
     // Reusable buffer for next-round bound polynomials to avoid reallocations
     pub next_polys: Option<Vec<DensePolynomial<F>>>,
+    // Configured L1 size (bytes) used for tile sizing. Defaulted if not provided.
+    pub l1_bytes: usize,
 }
 
 impl<F: JoltField> StreamingState<F> {
-    fn compute_tile_len(degree: usize) -> usize {
-        let l1_bytes: usize = 32 * 1024; // macbook pro 128kb, threadripper 32kb
+    fn compute_tile_len(degree: usize, l1_bytes: usize) -> usize {
         let elem_bytes: usize = core::mem::size_of::<F>().max(32); // BN254 ~32 bytes
         let d = degree.max(1);
         let mut tile_len = (l1_bytes / (d * elem_bytes)).max(64);
@@ -43,31 +44,67 @@ impl<F: JoltField> StreamingState<F> {
         1usize << pow
     }
 
-    fn new(degree: usize) -> Self {
-        let tile_len = Self::compute_tile_len(degree);
+    fn new(degree: usize, l1_bytes: usize) -> Self {
+        let tile_len = Self::compute_tile_len(degree, l1_bytes);
         let t_vals: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
         Self {
             tile_len,
             pending_r: None,
             t_vals,
             next_polys: None,
+            l1_bytes,
         }
     }
 }
 
 impl<F: JoltField> ProductSumcheck<F> {
-    pub fn from_polynomials_mode(polynomials: Vec<DensePolynomial<F>>, mode: ExecutionMode) -> Self {
+    pub fn from_polynomials_mode(polynomials: Vec<DensePolynomial<F>>, mode: ExecutionMode, l1_kb: Option<usize>) -> Self {
         let n = polynomials.get(0).map(|p| p.len()).unwrap_or(0);
         let log_n = if n == 0 { 0 } else { n.trailing_zeros() as usize };
         let degree = polynomials.len();
         let original_polynomials = polynomials.clone();
-        let input_claim = (0..n)
-            .into_par_iter()
-            .map(|i| polynomials.iter().fold(F::one(), |acc, poly| acc * poly.Z[i]))
-            .reduce(|| F::zero(), |a, b| a + b);
+        // Compute input_claim differently by mode for fair end-to-end benchmarking.
+        // - Batch: simple parallel map-reduce over i (no tiling), mirroring baseline behavior.
+        // - Streaming: partition-friendly tiled fold/reduce to minimize memory traffic.
+        let l1_bytes_cfg = l1_kb.map(|kb| kb * 1024).unwrap_or(32 * 1024);
+        let input_claim = match mode {
+            ExecutionMode::Batch => {
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| polynomials.iter().fold(F::one(), |acc, poly| acc * poly.Z[i]))
+                    .reduce(|| F::zero(), |a, b| a + b)
+            }
+            ExecutionMode::Streaming => {
+                let tile_len = StreamingState::<F>::compute_tile_len(degree, l1_bytes_cfg);
+                let num_tiles = if n == 0 { 0 } else { (n + tile_len - 1) / tile_len };
+                let (sum_total, _scratch) = (0..num_tiles)
+                    .into_par_iter()
+                    .fold(
+                        || (F::zero(), F::one()),
+                        |(mut sum_acc, mut _tmp_prod), tile_idx| {
+                            let start = tile_idx * tile_len;
+                            let end = core::cmp::min(start + tile_len, n);
+                            for i in start..end {
+                                let mut prod = F::one();
+                                for poly in polynomials.iter() {
+                                    prod = prod * poly.Z[i];
+                                }
+                                sum_acc = sum_acc + prod;
+                            }
+                            (sum_acc, _tmp_prod)
+                        },
+                    )
+                    .reduce(
+                        || (F::zero(), F::one()),
+                        |(a_sum, _), (b_sum, _)| (a_sum + b_sum, F::one()),
+                    );
+                sum_total
+            }
+        };
+
         let streaming = match mode {
             ExecutionMode::Batch => None,
-            ExecutionMode::Streaming => Some(StreamingState::new(degree)),
+            ExecutionMode::Streaming => Some(StreamingState::new(degree, l1_bytes_cfg)),
         };
         Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, streaming }
     }
@@ -243,6 +280,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         s.next_polys = Some(old_polys);
                     } else {
                         // No binding yet (round 0): evaluate directly from current arrays using full-size pairs
+                        // in practise this will never happen, but we include it for completeness
                         let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
@@ -379,7 +417,7 @@ mod tests {
     fn run_product_sumcheck_test(d: u32, mode: ExecutionMode) {
         let t = 10u32;
         let polys = build_random_dense_polys::<Fr>(t, d, "product_sumcheck_test");
-        let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, mode);
+        let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, mode, Some(32));
         let mut prover_transcript = Blake2bTranscript::new(b"sumcheck_test");
         let (proof, _chals) =
             SingleSumcheck::prove::<Fr, Blake2bTranscript>(&mut sumcheck, None, &mut prover_transcript);
