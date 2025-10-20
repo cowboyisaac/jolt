@@ -23,7 +23,6 @@ pub struct ProductSumcheck<F: JoltField> {
     pub degree: usize, // number of polynomials
     pub mode: ExecutionMode,
     pub tiling: Option<TilingState<F>>,
-    pub metrics: SumcheckMetrics,
 }
 
 pub struct TilingState<F: JoltField> {
@@ -66,7 +65,7 @@ impl<F: JoltField> ProductSumcheck<F> {
         // - Batch: simple parallel map-reduce over i (no tiling), mirroring baseline behavior.
         // - Tiling: partition-friendly tiled fold/reduce to minimize memory traffic.
         let l1_bytes_cfg = l1_kb.map(|kb| kb * 1024).unwrap_or(32 * 1024);
-        let (input_claim, input_ms) = match mode {
+        let (input_claim, _input_ms) = match mode {
             ExecutionMode::Batch => {
                 let t0 = Instant::now();
                 let v = (0..n)
@@ -108,7 +107,7 @@ impl<F: JoltField> ProductSumcheck<F> {
             ExecutionMode::Batch => None,
             ExecutionMode::Tiling => Some(TilingState::new(degree, l1_bytes_cfg)),
         };
-        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling, metrics: SumcheckMetrics { input_claim_ms: input_ms, compute_ms: 0.0 } }
+        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling }
     }
 }
 
@@ -118,7 +117,6 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
     fn input_claim(&self) -> F { self.input_claim }
 
     fn compute_prover_message(&mut self, _round: usize, _previous_claim: F) -> Vec<F> {
-        let t0 = Instant::now();
         match self.mode {
             ExecutionMode::Batch => {
                 // Fused single-pass computation for h(0) and h(2..=degree) over j.
@@ -171,9 +169,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                 let mut evals_at_points = vec![F::zero(); points_len];
                 evals_at_points[0] = h0_total;
                 for idx in 0..t_len { evals_at_points[idx + 1] = ht_total[idx]; }
-                let out = evals_at_points;
-                self.metrics.compute_ms += t0.elapsed().as_secs_f64() * 1000.0;
-                out
+                evals_at_points
             }
             ExecutionMode::Tiling => {
                 {
@@ -348,9 +344,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         for idx in 0..ht_total.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht_total[idx]; }
                     }
 
-                    let out = evals_at_points;
-                    this.metrics.compute_ms += t0.elapsed().as_secs_f64() * 1000.0;
-                    out
+                    evals_at_points
                 }
             }
         }
@@ -409,11 +403,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
 // Streaming executor implementation folded into ProductSumcheck
 impl<F: JoltField> ProductSumcheck<F> {}
 
-#[derive(Default, Clone)]
-pub struct SumcheckMetrics {
-    pub input_claim_ms: f64,
-    pub compute_ms: f64,
-}
+// SumcheckMetrics removed; benchmarking and reporting are handled in bench.rs
 
 #[cfg(test)]
 mod tests {

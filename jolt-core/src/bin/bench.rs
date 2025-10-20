@@ -231,7 +231,7 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
         });
     }
 
-    // Render a simple chart: x-axis T, two lines (batch, tiling) for each d; encode threads in legend
+    // Chart 1: by trace size (T)
     let root = BitMapBackend::new(&out_path, (1280, 720)).into_drawing_area();
     root.fill(&WHITE).unwrap();
     let y_max = rows.iter()
@@ -303,6 +303,69 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_p
 
     root.present().unwrap();
     println!("Wrote chart: {}", out_path);
+
+    // Chart 2: by threads (x-axis threads), one chart per d with all T values overlaid by phase
+    let out_threads = std::path::Path::new(&out_path)
+        .with_file_name("bench_by_threads.png");
+    let root2 = BitMapBackend::new(out_threads.to_str().unwrap(), (1280, 720)).into_drawing_area();
+    root2.fill(&WHITE).unwrap();
+    let threads_min = *thread_variants.iter().min().unwrap_or(&1) as i32;
+    let threads_max = *thread_variants.iter().max().unwrap_or(&1) as i32;
+    let y2_max = rows.iter()
+        .map(|r| r.8.max(r.9).max(r.10).max(r.11))
+        .fold(0.0, f64::max) * 1.2;
+    let mut chart2 = ChartBuilder::on(&root2)
+        .caption(
+            format!("Sumcheck Proving Time (ms) — by threads, L1={}kB, Ts={:?}", l1_kb, t_list),
+            ("sans-serif", 24)
+        )
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d(
+            (threads_min - 1)..(threads_max + 1),
+            0f64..y2_max
+        )
+        .unwrap();
+
+    chart2.configure_mesh().x_desc("threads").y_desc("ms").draw().unwrap();
+
+    for &d in &d_list {
+        for &t in &t_list {
+            let mut b_first: Vec<(i32, f64)> = Vec::new();
+            let mut b_prove: Vec<(i32, f64)> = Vec::new();
+            let mut t_first: Vec<(i32, f64)> = Vec::new();
+            let mut t_prove: Vec<(i32, f64)> = Vec::new();
+            for &(tt, dd, threads_here, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct) in rows.iter() {
+                if dd == d && tt == t {
+                    b_first.push((threads_here as i32, ib));
+                    b_prove.push((threads_here as i32, cb));
+                    t_first.push((threads_here as i32, it));
+                    t_prove.push((threads_here as i32, ct));
+                }
+            }
+            chart2.draw_series(LineSeries::new(b_first, &RED)).unwrap()
+                .label(format!("batch first_sum d={} T={}", d, t))
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+            chart2.draw_series(LineSeries::new(b_prove, &GREEN)).unwrap()
+                .label(format!("batch prove d={} T={}", d, t))
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
+            chart2.draw_series(LineSeries::new(t_first, &BLUE)).unwrap()
+                .label(format!("tiling first_sum d={} T={}", d, t))
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+            chart2.draw_series(LineSeries::new(t_prove, &MAGENTA)).unwrap()
+                .label(format!("tiling prove d={} T={}", d, t))
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
+        }
+    }
+    chart2
+        .configure_series_labels()
+        .background_style(&WHITE.mix(0.8))
+        .border_style(&BLACK)
+        .draw()
+        .unwrap();
+    root2.present().unwrap();
+    println!("Wrote chart: {}", out_threads.to_str().unwrap());
 }
 
 // ------------ Helpers moved from impl -------------
