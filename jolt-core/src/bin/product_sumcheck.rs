@@ -118,45 +118,56 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
     fn compute_prover_message(&mut self, _round: usize, _previous_claim: F) -> Vec<F> {
         match self.mode {
             ExecutionMode::Batch => {
+                // Fused single-pass computation for h(0) and h(2..=degree) over j.
+                // We evaluate all t-values in one sweep while data are hot, avoiding (d-1) extra passes.
                 let half = self.polynomials[0].len() / 2;
                 let degree = self.degree;
+                let points_len = 1 + (degree.saturating_sub(1));
+                if half == 0 { return vec![F::zero(); points_len]; }
 
-                let mut evals_at_points = vec![F::zero(); 1 + (degree.saturating_sub(1))];
-                // h(0)
-                let h0: F = (0..half)
-                    .into_par_iter()
-                    .map(|j| self.polynomials.iter().fold(F::one(), |acc, poly| acc * poly.Z[2 * j]))
-                    .reduce(|| F::zero(), |a, b| a + b);
-                evals_at_points[0] = h0;
-                // h(t) for t in 2..=degree
-                // Instead of recomputing (a + m*t_f) for every poly every t, 
-                // cache (a, m) for each (poly, j), then evaluate via Horner's method per t.
-                // Precompute a and m for every (poly, j)
-                let cache: Vec<Vec<(F, F)>> = (0..half)
-                    .into_par_iter()
-                    .map(|j| {
-                        self.polynomials.iter().map(|poly| {
-                            let a = poly.Z[2 * j];
-                            let b = poly.Z[2 * j + 1];
-                            let m = b - a;
-                            (a, m)
-                        }).collect::<Vec<_>>()
-                    })
-                    .collect();
+                // Precompute t values once per round
+                let t_vals: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
+                let t_len = t_vals.len();
 
-                for t in 2..=degree {
-                    let t_f = F::from_u64(t as u64);
-                    let ht: F = (0..half)
-                        .into_par_iter()
-                        .map(|j| {
-                            // Compute the product for this j using cached (a, m) and Horner
-                            cache[j].iter().fold(F::one(), |acc, &(a, m)| {
-                                acc * (a + m * t_f)
-                            })
-                        })
-                        .reduce(|| F::zero(), |a, b| a + b);
-                    evals_at_points[t - 1] = ht;
-                }
+                // Non-tiled single-pass: parallel fold directly over j for clean comparison to tiled streaming.
+                let (h0_total, ht_total, _scratch_prod) = (0..half)
+                    .into_par_iter()
+                    .fold(
+                        || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                        |(mut h0_acc, mut ht_acc, mut prod_t_acc), j| {
+                            // Compute a,m for each polynomial; multiply into h(0) and all h(t)
+                            let mut prod_a = F::one();
+                            for poly in self.polynomials.iter() {
+                                let a = poly.Z[2 * j];
+                                let b = poly.Z[2 * j + 1];
+                                let m = b - a;
+                                prod_a = prod_a * a;
+                                if t_len > 0 {
+                                    let mut v_t = a + m * t_vals[0];
+                                    prod_t_acc[0] = prod_t_acc[0] * v_t;
+                                    for idx in 1..t_len {
+                                        v_t = v_t + m;
+                                        prod_t_acc[idx] = prod_t_acc[idx] * v_t;
+                                    }
+                                }
+                            }
+                            h0_acc = h0_acc + prod_a;
+                            for idx in 0..t_len { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                            for v in &mut prod_t_acc { *v = F::one(); }
+                            (h0_acc, ht_acc, prod_t_acc)
+                        },
+                    )
+                    .reduce(
+                        || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                        |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
+                            for i in 0..t_len { ht_a[i] = ht_a[i] + ht_b[i]; }
+                            (h0_a + h0_b, ht_a, vec![F::one(); t_len])
+                        },
+                    );
+
+                let mut evals_at_points = vec![F::zero(); points_len];
+                evals_at_points[0] = h0_total;
+                for idx in 0..t_len { evals_at_points[idx + 1] = ht_total[idx]; }
                 evals_at_points
             }
             ExecutionMode::Streaming => {
