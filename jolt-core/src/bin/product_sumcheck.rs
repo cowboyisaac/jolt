@@ -39,7 +39,7 @@ impl<F: JoltField> TilingState<F> {
         let elem_bytes: usize = core::mem::size_of::<F>().max(32); // BN254 ~32 bytes
         let d = degree.max(1);
         let mut tile_len = (l1_bytes / (d * elem_bytes)).max(64);
-        tile_len = tile_len.min(1024);
+        tile_len = tile_len.min(512);
         let pow = usize::BITS - 1 - tile_len.leading_zeros();
         1usize << pow
     }
