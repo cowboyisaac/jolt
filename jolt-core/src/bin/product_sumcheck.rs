@@ -222,28 +222,28 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
 
-                                    // 1) Bind locally into next buffer for this tile's j-range (disjoint writes per tile)
-                                    for p_idx in 0..num_polys {
-                                        let src = &working[p_idx].Z;
-                                        // SAFETY: Writes are to disjoint j ranges per tile; tiles do not overlap.
-                                        let dst_base = next_polys[p_idx].Z.as_ptr() as *mut F;
-                                        for j in start..end {
-                                            let a = src[2 * j];
-                                            let b = src[2 * j + 1];
-                                            let y = a + r * (b - a);
-                                            unsafe { dst_base.add(j).write(y); }
-                                        }
-                                    }
-
-                                    // 2) Evaluate contributions over pairs entirely within this tile
+                                    // Evaluate contributions over pairs entirely within this tile,
+                                    // and write the bound outputs y0,y1 for this pair immediately.
                                     let k_start = (start + 1) >> 1; // first k with 2k >= start
                                     let k_end = end >> 1;            // last k with 2k+1 < end
                                     for k in k_start..k_end {
+                                        let j0 = 2 * k;
+                                        let j1 = 2 * k + 1;
                                         let mut prod_a = F::one();
                                         for p_idx in 0..num_polys {
+                                            let src = &working[p_idx].Z;
                                             let dst_base = next_polys[p_idx].Z.as_ptr() as *mut F;
-                                            let y0 = unsafe { dst_base.add(2 * k).read() };
-                                            let y1 = unsafe { dst_base.add(2 * k + 1).read() };
+                                            let a0 = src[2 * j0];
+                                            let b0 = src[2 * j0 + 1];
+                                            let y0 = a0 + r * (b0 - a0);
+                                            let a1 = src[2 * j1];
+                                            let b1 = src[2 * j1 + 1];
+                                            let y1 = a1 + r * (b1 - a1);
+                                            // write out immediately for next round
+                                            unsafe {
+                                                dst_base.add(j0).write(y0);
+                                                dst_base.add(j1).write(y1);
+                                            }
                                             let m2 = y1 - y0;
                                             prod_a = prod_a * y0;
                                             if t_len > 0 {
