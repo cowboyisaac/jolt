@@ -92,15 +92,29 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                     .reduce(|| F::zero(), |a, b| a + b);
                 evals_at_points[0] = h0;
                 // h(t) for t in 2..=degree
+                // Instead of recomputing (a + m*t_f) for every poly every t, 
+                // cache (a, m) for each (poly, j), then evaluate via Horner's method per t.
+                let num_polys = self.polynomials.len();
+                // Precompute a and m for every (poly, j)
+                let cache: Vec<Vec<(F, F)>> = (0..half)
+                    .into_par_iter()
+                    .map(|j| {
+                        self.polynomials.iter().map(|poly| {
+                            let a = poly.Z[2 * j];
+                            let b = poly.Z[2 * j + 1];
+                            let m = b - a;
+                            (a, m)
+                        }).collect::<Vec<_>>()
+                    })
+                    .collect();
+
                 for t in 2..=degree {
                     let t_f = F::from_u64(t as u64);
                     let ht: F = (0..half)
                         .into_par_iter()
                         .map(|j| {
-                            self.polynomials.iter().fold(F::one(), |acc, poly| {
-                                let a = poly.Z[2 * j];
-                                let b = poly.Z[2 * j + 1];
-                                let m = b - a;
+                            // Compute the product for this j using cached (a, m) and Horner
+                            cache[j].iter().fold(F::one(), |acc, &(a, m)| {
                                 acc * (a + m * t_f)
                             })
                         })
@@ -110,7 +124,152 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                 evals_at_points
             }
             ExecutionMode::Streaming => {
-                self.compute_once_streaming()
+                {
+                    let this = &mut *self;
+                    let s = this.streaming.as_mut().expect("streaming state expected");
+                    let r_opt = s.pending_r.take();
+
+                    // Working view for this round
+                    let working: &[DensePolynomial<F>] = &this.polynomials;
+                    let len_before = working[0].len();
+                    for (i, poly) in working.iter().enumerate() {
+                        assert_eq!(poly.len(), len_before, "Polynomial {} has length {}, expected {}", i, poly.len(), len_before);
+                    }
+                    // Dimensions and precomputed values (computed once per round)
+                    let half_before = len_before / 2;
+                    let degree = this.degree; // number of polynomials
+                    let points_len = 1 + (degree.saturating_sub(1));
+                    let t_vals = &s.t_vals; // t in [2..=degree]
+                    let t_len = t_vals.len();
+                    let num_polys = working.len();
+                    if half_before == 0 { return vec![F::zero(); points_len]; }
+
+                    let num_tiles = (half_before + s.tile_len - 1) / s.tile_len;
+
+                    // Accumulator for this round's prover message evaluations: [h(0), h(2), ..., h(d)]
+                    let mut evals_at_points = vec![F::zero(); points_len];
+
+                    if let Some(r) = r_opt {
+                        // Phase 1: bind arrays once for the next round (parallel over polynomials), reusing buffer
+                        let mut next_polys = s
+                            .next_polys
+                            .take()
+                            .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect());
+                        if next_polys.len() != num_polys {
+                            next_polys = (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect();
+                        }
+                        for p in 0..num_polys {
+                            if next_polys[p].len() != half_before { next_polys[p] = DensePolynomial::new(vec![F::zero(); half_before]); }
+                        }
+
+                        next_polys
+                            .par_iter_mut()
+                            .enumerate()
+                            .for_each(|(p_idx, dst)| {
+                                let src = &working[p_idx].Z;
+                                for j in 0..half_before {
+                                    let a = src[2 * j];
+                                    let b = src[2 * j + 1];
+                                    dst.Z[j] = a + r * (b - a);
+                                }
+                            });
+
+                        // Phase 2: evaluate in parallel over tiles reading bound arrays (no duplicate y computation)
+                        let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
+                            .into_par_iter()
+                            .map(|tile_idx| {
+                                let start = tile_idx * s.tile_len;
+                                let end = core::cmp::min(start + s.tile_len, half_before);
+                                let start_even = start & !1;
+                                let end_even = end & !1;
+                                let k_start = start_even / 2;
+                                let k_end = end_even / 2;
+
+                                // Per-tile accumulators
+                                let mut tile_h0_accumulator = F::zero();
+                                let mut tile_ht_accumulator = vec![F::zero(); t_len];
+                                let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
+
+                                for k in k_start..k_end {
+                                    let mut prod_a_accumulator = F::one();
+                                    for poly in next_polys.iter() {
+                                        let y0 = poly.Z[2 * k];
+                                        let y1 = poly.Z[2 * k + 1];
+                                        let m2 = y1 - y0;
+                                        prod_a_accumulator = prod_a_accumulator * y0;
+                                        if t_len > 0 {
+                                            // Incremental evaluation across t: v_t = y0 + m2 * t; next t adds m2
+                                            let mut v_t = y0 + m2 * t_vals[0];
+                                            // idx = 0
+                                            prod_t_accumulator[0] = prod_t_accumulator[0] * v_t;
+                                            // idx >= 1
+                                            for idx in 1..t_len {
+                                                v_t = v_t + m2;
+                                                prod_t_accumulator[idx] = prod_t_accumulator[idx] * v_t;
+                                            }
+                                        }
+                                    }
+                                    tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
+                                    for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
+                                    for v in &mut prod_t_accumulator { *v = F::one(); }
+                                }
+                                (tile_h0_accumulator, tile_ht_accumulator)
+                            })
+                            .collect();
+
+                        for (h0, ht) in tile_evals.into_iter() {
+                            evals_at_points[0] = evals_at_points[0] + h0;
+                            for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
+                        }
+
+                        // Swap in bound arrays and keep previous buffers for reuse without cloning
+                        let old_polys = std::mem::replace(&mut this.polynomials, next_polys);
+                        s.next_polys = Some(old_polys);
+                    } else {
+                        // No binding yet (round 0): evaluate directly from current arrays using full-size pairs
+                        let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
+                            .into_par_iter()
+                            .map(|tile_idx| {
+                                let start = tile_idx * s.tile_len;
+                                let end = core::cmp::min(start + s.tile_len, half_before);
+                                // Per-tile accumulators
+                                let mut tile_h0_accumulator = F::zero();
+                                let mut tile_ht_accumulator = vec![F::zero(); t_len];
+                                let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
+                                for j in start..end {
+                                    // Product accumulators across polynomials for this full pair
+                                    let mut prod_a_accumulator = F::one();
+                                    for poly in working.iter() {
+                                        let a = poly.Z[2 * j];
+                                        let b = poly.Z[2 * j + 1];
+                                        let m = b - a;
+                                        prod_a_accumulator = prod_a_accumulator * a;
+                                        if t_len > 0 {
+                                            // v_t = a + m * t; update incrementally by adding m
+                                            let mut v_t = a + m * t_vals[0];
+                                            prod_t_accumulator[0] = prod_t_accumulator[0] * v_t;
+                                            for idx in 1..t_len {
+                                                v_t = v_t + m;
+                                                prod_t_accumulator[idx] = prod_t_accumulator[idx] * v_t;
+                                            }
+                                        }
+                                    }
+                                    tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
+                                    for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
+                                    for v in &mut prod_t_accumulator { *v = F::one(); }
+                                }
+                                (tile_h0_accumulator, tile_ht_accumulator)
+                            })
+                            .collect();
+
+                        for (h0, ht) in tile_evals.into_iter() {
+                            evals_at_points[0] = evals_at_points[0] + h0;
+                            for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
+                        }
+                    }
+
+                    evals_at_points
+                }
             }
         }
     }
@@ -167,151 +326,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
 
 // Streaming executor implementation folded into ProductSumcheck
 impl<F: JoltField> ProductSumcheck<F> {
-    fn compute_once_streaming(&mut self) -> Vec<F> {
-        let s = self.streaming.as_mut().expect("streaming state expected");
-        let r_opt = s.pending_r.take();
-
-        // Working view for this round
-        let working: &[DensePolynomial<F>] = &self.polynomials;
-        let len_before = working[0].len();
-        for (i, poly) in working.iter().enumerate() {
-            assert_eq!(poly.len(), len_before, "Polynomial {} has length {}, expected {}", i, poly.len(), len_before);
-        }
-        // Dimensions and precomputed values (computed once per round)
-        let half_before = len_before / 2;
-        let degree = self.degree; // number of polynomials
-        let points_len = 1 + (degree.saturating_sub(1));
-        let t_vals = &s.t_vals; // t in [2..=degree]
-        let t_len = t_vals.len();
-        let num_polys = working.len();
-        if half_before == 0 { return vec![F::zero(); points_len]; }
-
-        let num_tiles = (half_before + s.tile_len - 1) / s.tile_len;
-
-        // Accumulator for this round's prover message evaluations: [h(0), h(2), ..., h(d)]
-        let mut evals_at_points = vec![F::zero(); points_len];
-
-        if let Some(r) = r_opt {
-            // Phase 1: bind arrays once for the next round (parallel over polynomials), reusing buffer
-            let mut next_polys = s
-                .next_polys
-                .take()
-                .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect());
-            if next_polys.len() != num_polys {
-                next_polys = (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect();
-            }
-            for p in 0..num_polys {
-                if next_polys[p].len() != half_before { next_polys[p] = DensePolynomial::new(vec![F::zero(); half_before]); }
-            }
-
-            next_polys
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(p_idx, dst)| {
-                    let src = &working[p_idx].Z;
-                    for j in 0..half_before {
-                        let a = src[2 * j];
-                        let b = src[2 * j + 1];
-                        dst.Z[j] = a + r * (b - a);
-                    }
-                });
-
-            // Phase 2: evaluate in parallel over tiles reading bound arrays (no duplicate y computation)
-            let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
-                .into_par_iter()
-                .map(|tile_idx| {
-                    let start = tile_idx * s.tile_len;
-                    let end = core::cmp::min(start + s.tile_len, half_before);
-                    let start_even = start & !1;
-                    let end_even = end & !1;
-                    let k_start = start_even / 2;
-                    let k_end = end_even / 2;
-
-                    // Per-tile accumulators
-                    let mut tile_h0_accumulator = F::zero();
-                    let mut tile_ht_accumulator = vec![F::zero(); t_len];
-                    let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
-
-                    for k in k_start..k_end {
-                        let mut prod_a_accumulator = F::one();
-                        for poly in next_polys.iter() {
-                            let y0 = poly.Z[2 * k];
-                            let y1 = poly.Z[2 * k + 1];
-                            let m2 = y1 - y0;
-                            prod_a_accumulator = prod_a_accumulator * y0;
-                            if t_len > 0 {
-                                // Incremental evaluation across t: v_t = y0 + m2 * t; next t adds m2
-                                let mut v_t = y0 + m2 * t_vals[0];
-                                // idx = 0
-                                prod_t_accumulator[0] = prod_t_accumulator[0] * v_t;
-                                // idx >= 1
-                                for idx in 1..t_len {
-                                    v_t = v_t + m2;
-                                    prod_t_accumulator[idx] = prod_t_accumulator[idx] * v_t;
-                                }
-                            }
-                        }
-                        tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
-                        for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
-                        for v in &mut prod_t_accumulator { *v = F::one(); }
-                    }
-                    (tile_h0_accumulator, tile_ht_accumulator)
-                })
-                .collect();
-
-            for (h0, ht) in tile_evals.into_iter() {
-                evals_at_points[0] = evals_at_points[0] + h0;
-                for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
-            }
-
-            // Swap in bound arrays and keep previous buffers for reuse without cloning
-            let old_polys = std::mem::replace(&mut self.polynomials, next_polys);
-            s.next_polys = Some(old_polys);
-        } else {
-            // No binding yet (round 0): evaluate directly from current arrays using full-size pairs
-            let tile_evals: Vec<(F, Vec<F>)> = (0..num_tiles)
-                .into_par_iter()
-                .map(|tile_idx| {
-                    let start = tile_idx * s.tile_len;
-                    let end = core::cmp::min(start + s.tile_len, half_before);
-                    // Per-tile accumulators
-                    let mut tile_h0_accumulator = F::zero();
-                    let mut tile_ht_accumulator = vec![F::zero(); t_len];
-                    let mut prod_t_accumulator: Vec<F> = vec![F::one(); t_len];
-                    for j in start..end {
-                        // Product accumulators across polynomials for this full pair
-                        let mut prod_a_accumulator = F::one();
-                        for poly in working.iter() {
-                            let a = poly.Z[2 * j];
-                            let b = poly.Z[2 * j + 1];
-                            let m = b - a;
-                            prod_a_accumulator = prod_a_accumulator * a;
-                            if t_len > 0 {
-                                // v_t = a + m * t; update incrementally by adding m
-                                let mut v_t = a + m * t_vals[0];
-                                prod_t_accumulator[0] = prod_t_accumulator[0] * v_t;
-                                for idx in 1..t_len {
-                                    v_t = v_t + m;
-                                    prod_t_accumulator[idx] = prod_t_accumulator[idx] * v_t;
-                                }
-                            }
-                        }
-                        tile_h0_accumulator = tile_h0_accumulator + prod_a_accumulator;
-                        for idx in 0..t_len { tile_ht_accumulator[idx] = tile_ht_accumulator[idx] + prod_t_accumulator[idx]; }
-                        for v in &mut prod_t_accumulator { *v = F::one(); }
-                    }
-                    (tile_h0_accumulator, tile_ht_accumulator)
-                })
-                .collect();
-
-            for (h0, ht) in tile_evals.into_iter() {
-                evals_at_points[0] = evals_at_points[0] + h0;
-                for idx in 0..ht.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht[idx]; }
-            }
-        }
-
-        evals_at_points
-    }
+    
 }
 
 #[cfg(test)]
