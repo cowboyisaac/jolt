@@ -5,6 +5,8 @@ use jolt_core::poly::opening_proof::{OpeningPoint, ProverOpeningAccumulator, Ver
 use jolt_core::subprotocols::sumcheck::SumcheckInstance;
 use jolt_core::transcripts::Transcript;
 use jolt_core::utils::thread::unsafe_allocate_zero_vec;
+#[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
+use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -223,6 +225,13 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                             debug_assert!(buf.len() >= cur_len);
                                             for off in 0..cur_len {
                                                 let j = start + off;
+                                                // Prefetch future source elements to L1
+                                                #[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
+                                                unsafe {
+                                                    let pf_j = core::cmp::min(j + 32, len_before - 1);
+                                                    let pf_ptr = src.as_ptr().add(2 * pf_j) as *const i8;
+                                                    _mm_prefetch(pf_ptr, _MM_HINT_T0);
+                                                }
                                                 let a = src[2 * j];
                                                 let b = src[2 * j + 1];
                                                 let m = b - a;
@@ -261,6 +270,12 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                         // Bulk copy buffers to destination arrays (fast path)
                                         for p_idx in 0..num_polys {
                                             let dst_base = base_addrs[p_idx] as *mut F;
+                                            // Prefetch destination lines ahead of copy
+                                            #[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
+                                            unsafe {
+                                                let pf_ptr = dst_base.add(start) as *const i8;
+                                                _mm_prefetch(pf_ptr, _MM_HINT_T0);
+                                            }
                                             unsafe {
                                                 std::ptr::copy_nonoverlapping(
                                                     tile_bufs[p_idx].as_ptr(),

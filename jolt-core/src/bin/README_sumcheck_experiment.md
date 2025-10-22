@@ -43,6 +43,15 @@ cargo run --release -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --t
 Batch mode iterates over each thread count and runs the full grid for every `T × d`. Logs include the selected `threads` value for each run. The chart now separates phases: it draws four series per `(d, threads)` pair — `batch first_sum`, `batch prove`, `tiling first_sum`, and `tiling prove` — so you can see phase-level scaling.
 
 ## Modes
+- Optional software prefetching (x86_64 only):
+  - Guarded by cargo feature `tiling_prefetch` and target `x86_64`.
+  - Enable with:
+    - Single run/compare:
+      - `cargo run --release -p jolt-core --features tiling_prefetch --bin bench -- run --T 24 --d 3 --mode 1 --tile-len 512`
+      - `cargo run --release -p jolt-core --features tiling_prefetch --bin bench -- compare --T 24 --d 3 --tile-len 512`
+    - Batch:
+      - `cargo run --release -p jolt-core --features tiling_prefetch --bin bench -- batch --T 22,24,26 --d 3 --tile-len 512`
+  - If not specified or on non-x86_64 targets, prefetch code is not compiled.
 
 - **Mode 0 - Batch**: Uses `SingleSumcheck` with `ProductSumcheck` in batch mode; input_claim uses a parallel map-reduce over i (no tiling), mirroring baseline behavior.
 - **Mode 1 - Tiling**: Uses `SingleSumcheck` with `ProductSumcheck` in tiling mode; input_claim uses a partition-friendly tiled fold/reduce with `--tile-len` if provided, or an internal heuristic when omitted.
