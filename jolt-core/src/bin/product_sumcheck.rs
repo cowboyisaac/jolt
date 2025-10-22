@@ -184,11 +184,14 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         if next_polys.len() != num_polys {
                             next_polys = (0..num_polys).map(|_| DensePolynomial::new(unsafe_allocate_zero_vec(half_before))).collect();
                         }
-                        for p in 0..num_polys {
-                            if next_polys[p].len() != half_before {
-                                next_polys[p].len = half_before;
-                                next_polys[p].num_vars = (usize::BITS as usize - 1) - half_before.leading_zeros() as usize;
+                        for poly in next_polys.iter_mut() {
+                            if poly.Z.len() < half_before {
+                                let needed = half_before - poly.Z.len();
+                                let additional = unsafe_allocate_zero_vec(needed);
+                                poly.Z.extend_from_slice(&additional);
                             }
+                            poly.len = half_before;
+                            poly.num_vars = (usize::BITS as usize - 1) - half_before.leading_zeros() as usize;
                         }
 
                         // Prepare raw base addresses for next-round arrays. We use integer base addresses here
@@ -198,26 +201,26 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                             .map(|p| p.Z.as_mut_ptr() as usize)
                             .collect();
 
-                        // Parallel tiles with per-worker accumulators; per tile we first write y sequentially per polynomial,
-                        // then read those y back to accumulate h(·). This preserves fused semantics and maximizes write coalescing.
-                        let (h0_total, ht_total, _worker_scratch) = (0..num_tiles)
+                        // Parallel tiles with per-worker reusable tile buffers to avoid per-tile allocations.
+                        let (h0_total, ht_total, _scratch_prod, _worker_bufs) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
-                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
-                                |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
+                                || {
+                                    let tile_bufs: Vec<Vec<F>> = (0..num_polys)
+                                        .map(|_| unsafe_allocate_zero_vec(s.tile_len))
+                                        .collect();
+                                    (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points], tile_bufs)
+                                },
+                                |(mut h0_acc, mut ht_acc, mut prod_t_acc, mut tile_bufs), tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
                                     if start < end {
                                         let cur_len = end - start;
-                                        // Tile-local buffers: compute all y into per-polynomial buffers, accumulate from buffers, then bulk copy to destination.
-                                        let mut tile_bufs: Vec<Vec<F>> = (0..num_polys)
-                                            .map(|_| unsafe_allocate_zero_vec(cur_len))
-                                            .collect();
-
-                                        // Fill buffers
+                                        // Fill buffers (only first cur_len entries are written)
                                         for p_idx in 0..num_polys {
                                             let src = &working[p_idx].Z;
                                             let buf = &mut tile_bufs[p_idx];
+                                            debug_assert!(buf.len() >= cur_len);
                                             for off in 0..cur_len {
                                                 let j = start + off;
                                                 let a = src[2 * j];
@@ -255,21 +258,26 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                             for v in &mut prod_t_acc { *v = F::one(); }
                                         }
 
-                                        // Bulk copy buffers to destination arrays
+                                        // Bulk copy buffers to destination arrays (fast path)
                                         for p_idx in 0..num_polys {
                                             let dst_base = base_addrs[p_idx] as *mut F;
-                                            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_base.add(start), cur_len) };
-                                            dst_slice.copy_from_slice(&tile_bufs[p_idx]);
+                                            unsafe {
+                                                std::ptr::copy_nonoverlapping(
+                                                    tile_bufs[p_idx].as_ptr(),
+                                                    dst_base.add(start),
+                                                    cur_len,
+                                                );
+                                            }
                                         }
                                     }
-                                    (h0_acc, ht_acc, prod_t_acc)
+                                    (h0_acc, ht_acc, prod_t_acc, tile_bufs)
                                 },
                             )
                             .reduce(
-                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
-                                |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
+                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points], Vec::new()),
+                                |(h0_a, mut ht_a, _, _), (h0_b, ht_b, _, _)| {
                                     for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
-                                    (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points])
+                                    (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points], Vec::new())
                                 },
                             );
 
