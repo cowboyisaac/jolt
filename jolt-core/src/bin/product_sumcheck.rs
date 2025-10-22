@@ -41,8 +41,12 @@ pub struct TilingState<F: JoltField> {
 impl<F: JoltField> TilingState<F> {
     fn new_with_tile_len(degree: usize, tile_len: usize) -> Self {
         let eval_points: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
+        // Ensure tile length is even so pairs (j0, j1) are well formed and cache lines are fully utilized.
+        let mut tl = tile_len;
+        if tl & 1 == 1 { tl -= 1; }
+        if tl < 2 { tl = 2; }
         Self {
-            tile_len,
+            tile_len: tl,
             pending_r: None,
             eval_points,
             next_polys: None,
@@ -205,44 +209,42 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                     let end = core::cmp::min(start + s.tile_len, half_before);
                                     if start < end {
                                         let cur_len = end - start;
-                                        // Phase 1: sequentially write y[j] to next round arrays for each polynomial, contiguous per tile
-                                        for p_idx in 0..num_polys {
-                                            let src = &working[p_idx].Z;
-                                            let dst_base = base_addrs[p_idx] as *mut F;
-                                            for off in 0..cur_len {
-                                                let j = start + off;
+                                        // Streaming single pass to avoid read-after-write: write y[j] sequentially; on odd j, use buffered even y to accumulate.
+                                        let mut prev_even: Vec<F> = vec![F::zero(); num_polys];
+                                        for off in 0..cur_len {
+                                            let j = start + off;
+                                            let is_even = (j & 1) == 0;
+                                            let mut prod_a_pair = F::one();
+                                            for p_idx in 0..num_polys {
+                                                let src = &working[p_idx].Z;
+                                                let dst_base = base_addrs[p_idx] as *mut F;
                                                 let a = src[2 * j];
                                                 let b = src[2 * j + 1];
                                                 let m = b - a;
                                                 let y = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
                                                 unsafe { dst_base.add(j).write(y); }
-                                            }
-                                        }
-                                        // Phase 2: accumulate h within this tile by reading freshly written y back
-                                        let k_start = (start + 1) >> 1;
-                                        let k_end = end >> 1;
-                                        for k in k_start..k_end {
-                                            let j0 = 2 * k;
-                                            let j1 = 2 * k + 1;
-                                            let mut prod_a = F::one();
-                                            for p_idx in 0..num_polys {
-                                                let dst_base = base_addrs[p_idx] as *const F;
-                                                let y0 = unsafe { dst_base.add(j0).read() };
-                                                let y1 = unsafe { dst_base.add(j1).read() };
-                                                let m2 = y1 - y0;
-                                                prod_a = prod_a * y0;
-                                                if num_eval_points > 0 {
-                                                    let mut v_t = y0 + m2 * eval_points[0];
-                                                    prod_t_acc[0] = prod_t_acc[0] * v_t;
-                                                    for idx in 1..num_eval_points {
-                                                        v_t = v_t + m2;
-                                                        prod_t_acc[idx] = prod_t_acc[idx] * v_t;
+                                                if is_even {
+                                                    prev_even[p_idx] = y;
+                                                } else {
+                                                    let y0 = prev_even[p_idx];
+                                                    let y1 = y;
+                                                    let m2 = y1 - y0;
+                                                    prod_a_pair = prod_a_pair * y0;
+                                                    if num_eval_points > 0 {
+                                                        let mut v_t = y0 + m2 * eval_points[0];
+                                                        prod_t_acc[0] = prod_t_acc[0] * v_t;
+                                                        for idx in 1..num_eval_points {
+                                                            v_t = v_t + m2;
+                                                            prod_t_acc[idx] = prod_t_acc[idx] * v_t;
+                                                        }
                                                     }
                                                 }
                                             }
-                                            h0_acc = h0_acc + prod_a;
-                                            for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
-                                            for v in &mut prod_t_acc { *v = F::one(); }
+                                            if !is_even {
+                                                h0_acc = h0_acc + prod_a_pair;
+                                                for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                                                for v in &mut prod_t_acc { *v = F::one(); }
+                                            }
                                         }
                                     }
                                     (h0_acc, ht_acc, prod_t_acc)
