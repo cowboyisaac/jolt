@@ -209,42 +209,57 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                     let end = core::cmp::min(start + s.tile_len, half_before);
                                     if start < end {
                                         let cur_len = end - start;
-                                        // Streaming single pass to avoid read-after-write: write y[j] sequentially; on odd j, use buffered even y to accumulate.
-                                        let mut prev_even: Vec<F> = vec![F::zero(); num_polys];
-                                        for off in 0..cur_len {
-                                            let j = start + off;
-                                            let is_even = (j & 1) == 0;
-                                            let mut prod_a_pair = F::one();
-                                            for p_idx in 0..num_polys {
-                                                let src = &working[p_idx].Z;
-                                                let dst_base = base_addrs[p_idx] as *mut F;
+                                        // Tile-local buffers: compute all y into per-polynomial buffers, accumulate from buffers, then bulk copy to destination.
+                                        let mut tile_bufs: Vec<Vec<F>> = (0..num_polys)
+                                            .map(|_| unsafe_allocate_zero_vec(cur_len))
+                                            .collect();
+
+                                        // Fill buffers
+                                        for p_idx in 0..num_polys {
+                                            let src = &working[p_idx].Z;
+                                            let buf = &mut tile_bufs[p_idx];
+                                            for off in 0..cur_len {
+                                                let j = start + off;
                                                 let a = src[2 * j];
                                                 let b = src[2 * j + 1];
                                                 let m = b - a;
-                                                let y = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
-                                                unsafe { dst_base.add(j).write(y); }
-                                                if is_even {
-                                                    prev_even[p_idx] = y;
-                                                } else {
-                                                    let y0 = prev_even[p_idx];
-                                                    let y1 = y;
-                                                    let m2 = y1 - y0;
-                                                    prod_a_pair = prod_a_pair * y0;
-                                                    if num_eval_points > 0 {
-                                                        let mut v_t = y0 + m2 * eval_points[0];
-                                                        prod_t_acc[0] = prod_t_acc[0] * v_t;
-                                                        for idx in 1..num_eval_points {
-                                                            v_t = v_t + m2;
-                                                            prod_t_acc[idx] = prod_t_acc[idx] * v_t;
-                                                        }
+                                                buf[off] = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
+                                            }
+                                        }
+
+                                        // Accumulate from buffers using (j0,j1) within the tile
+                                        let k_start = (start + 1) >> 1;
+                                        let k_end = end >> 1;
+                                        for k in k_start..k_end {
+                                            let j0 = 2 * k;
+                                            let j1 = 2 * k + 1;
+                                            let off0 = j0 - start;
+                                            let off1 = j1 - start;
+                                            let mut prod_a = F::one();
+                                            for p_idx in 0..num_polys {
+                                                let y0 = tile_bufs[p_idx][off0];
+                                                let y1 = tile_bufs[p_idx][off1];
+                                                let m2 = y1 - y0;
+                                                prod_a = prod_a * y0;
+                                                if num_eval_points > 0 {
+                                                    let mut v_t = y0 + m2 * eval_points[0];
+                                                    prod_t_acc[0] = prod_t_acc[0] * v_t;
+                                                    for idx in 1..num_eval_points {
+                                                        v_t = v_t + m2;
+                                                        prod_t_acc[idx] = prod_t_acc[idx] * v_t;
                                                     }
                                                 }
                                             }
-                                            if !is_even {
-                                                h0_acc = h0_acc + prod_a_pair;
-                                                for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
-                                                for v in &mut prod_t_acc { *v = F::one(); }
-                                            }
+                                            h0_acc = h0_acc + prod_a;
+                                            for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                                            for v in &mut prod_t_acc { *v = F::one(); }
+                                        }
+
+                                        // Bulk copy buffers to destination arrays
+                                        for p_idx in 0..num_polys {
+                                            let dst_base = base_addrs[p_idx] as *mut F;
+                                            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst_base.add(start), cur_len) };
+                                            dst_slice.copy_from_slice(&tile_bufs[p_idx]);
                                         }
                                     }
                                     (h0_acc, ht_acc, prod_t_acc)
