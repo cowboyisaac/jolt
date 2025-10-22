@@ -4,7 +4,7 @@ use jolt_core::poly::multilinear_polynomial::BindingOrder;
 use jolt_core::poly::opening_proof::{OpeningPoint, ProverOpeningAccumulator, VerifierOpeningAccumulator, BIG_ENDIAN};
 use jolt_core::subprotocols::sumcheck::SumcheckInstance;
 use jolt_core::transcripts::Transcript;
-use jolt_core::utils::thread::{unsafe_allocate_zero_vec, unsafe_allocate_zero_vec_aligned};
+use jolt_core::utils::thread::unsafe_allocate_zero_vec;
 use smallvec::SmallVec;
 #[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
 use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -190,18 +190,14 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         let mut next_polys = s
                             .next_polys
                             .take()
-                            .unwrap_or_else(|| (0..num_polys).map(|_| {
-                                DensePolynomial::new(unsafe_allocate_zero_vec_aligned(half_before, 64))
-                            }).collect());
+                            .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(unsafe_allocate_zero_vec(half_before))).collect());
                         if next_polys.len() != num_polys {
-                            next_polys = (0..num_polys).map(|_| {
-                                DensePolynomial::new(unsafe_allocate_zero_vec_aligned(half_before, 64))
-                            }).collect();
+                            next_polys = (0..num_polys).map(|_| DensePolynomial::new(unsafe_allocate_zero_vec(half_before))).collect();
                         }
                         for poly in next_polys.iter_mut() {
                             if poly.Z.len() < half_before {
                                 let needed = half_before - poly.Z.len();
-                                let additional = unsafe_allocate_zero_vec_aligned(needed, 64);
+                                let additional = unsafe_allocate_zero_vec(needed);
                                 poly.Z.extend_from_slice(&additional);
                             }
                             poly.len = half_before;
