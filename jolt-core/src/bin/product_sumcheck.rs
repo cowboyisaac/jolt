@@ -5,6 +5,7 @@ use jolt_core::poly::opening_proof::{OpeningPoint, ProverOpeningAccumulator, Ver
 use jolt_core::subprotocols::sumcheck::SumcheckInstance;
 use jolt_core::transcripts::Transcript;
 use jolt_core::utils::thread::unsafe_allocate_zero_vec;
+use smallvec::SmallVec;
 #[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
 use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use rayon::prelude::*;
@@ -105,10 +106,17 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                 let num_eval_points = eval_points.len();
 
                 // Non-tiled single-pass: parallel fold directly over j for clean comparison to tiled streaming.
+                // Helpers to build stack-backed SmallVec accumulators
+                let make_sv = |val: F| {
+                    let mut sv: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                    for _ in 0..num_eval_points { sv.push(val); }
+                    sv
+                };
+
                 let (h0_total, ht_total, _scratch_prod) = (0..half)
                     .into_par_iter()
                     .fold(
-                        || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
+                        || (F::zero(), make_sv(F::zero()), make_sv(F::one())),
                         |(mut h0_acc, mut ht_acc, mut prod_t_acc), j| {
                             // Compute a,m for each polynomial; multiply into h(0) and all h(t)
                             let mut prod_a = F::one();
@@ -133,10 +141,10 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         },
                     )
                     .reduce(
-                        || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
+                        || (F::zero(), make_sv(F::zero()), make_sv(F::one())),
                         |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
                             for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
-                            (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points])
+                            (h0_a + h0_b, ht_a, make_sv(F::one()))
                         },
                     );
 
@@ -211,7 +219,11 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                     let tile_bufs: Vec<Vec<F>> = (0..num_polys)
                                         .map(|_| unsafe_allocate_zero_vec(s.tile_len))
                                         .collect();
-                                    (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points], tile_bufs)
+                                    let mut sv_zero: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_zero.push(F::zero()); }
+                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                    (F::zero(), sv_zero, sv_one, tile_bufs)
                                 },
                                 |(mut h0_acc, mut ht_acc, mut prod_t_acc, mut tile_bufs), tile_idx| {
                                     let start = tile_idx * s.tile_len;
@@ -289,10 +301,18 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                 },
                             )
                             .reduce(
-                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points], Vec::new()),
+                                || {
+                                    let mut sv_zero: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_zero.push(F::zero()); }
+                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                    (F::zero(), sv_zero, sv_one, Vec::new())
+                                },
                                 |(h0_a, mut ht_a, _, _), (h0_b, ht_b, _, _)| {
                                     for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
-                                    (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points], Vec::new())
+                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                    (h0_a + h0_b, ht_a, sv_one, Vec::new())
                                 },
                             );
 
@@ -307,7 +327,13 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
-                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
+                                || {
+                                    let mut sv_zero: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_zero.push(F::zero()); }
+                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                    (F::zero(), sv_zero, sv_one)
+                                },
                                 |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
@@ -336,10 +362,18 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                 },
                             )
                             .reduce(
-                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
+                                || {
+                                    let mut sv_zero: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_zero.push(F::zero()); }
+                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                    (F::zero(), sv_zero, sv_one)
+                                },
                                 |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
                                     for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
-                                    (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points])
+                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                    (h0_a + h0_b, ht_a, sv_one)
                                 },
                             );
 

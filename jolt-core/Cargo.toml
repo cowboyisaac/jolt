@@ -52,6 +52,7 @@ test_incremental = []
 challenge-254-bit = []
 
 [dependencies]
+smallvec = "1"
 plotters = "0.3"
 ark-bn254.workspace = true
 ark-grumpkin.workspace = true

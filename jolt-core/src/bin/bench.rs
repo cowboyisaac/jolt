@@ -226,7 +226,7 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
                         let threads_here = rayon::current_num_threads();
                         let tile_len_val = tile_len_opt.unwrap_or(0);
                         println!(
-                        "T={}, d={}, threads={}, tile_len={}\n  Batch:  input-eval={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling: input-eval={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms",
+                        "T={}, d={}, threads={}, tile_len={}\n  Batch:  input-claim={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling: input-claim={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms",
                         t, d, threads_here, tile_len_val,
                         input_batch_ms, boot_batch_ms, recur_batch_ms, claim_batch == claim_tiling,
                         input_tiling_ms, boot_tiling_ms, recur_tiling_ms
