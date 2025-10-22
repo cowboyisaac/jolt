@@ -4,6 +4,7 @@ use jolt_core::poly::multilinear_polynomial::BindingOrder;
 use jolt_core::poly::opening_proof::{OpeningPoint, ProverOpeningAccumulator, VerifierOpeningAccumulator, BIG_ENDIAN};
 use jolt_core::subprotocols::sumcheck::SumcheckInstance;
 use jolt_core::transcripts::Transcript;
+use jolt_core::utils::thread::unsafe_allocate_zero_vec;
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,18 +33,18 @@ pub struct ProductSumcheck<F: JoltField> {
 pub struct TilingState<F: JoltField> {
     pub tile_len: usize,
     pub pending_r: Option<F::Challenge>,
-    pub t_vals: Vec<F>,
+    pub eval_points: Vec<F>,
     // Reusable buffer for next-round bound polynomials to avoid reallocations
     pub next_polys: Option<Vec<DensePolynomial<F>>>,
 }
 
 impl<F: JoltField> TilingState<F> {
     fn new_with_tile_len(degree: usize, tile_len: usize) -> Self {
-        let t_vals: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
+        let eval_points: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
         Self {
             tile_len,
             pending_r: None,
-            t_vals,
+            eval_points,
             next_polys: None,
         }
     }
@@ -93,15 +94,15 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                 let points_len = 1 + (degree.saturating_sub(1));
                 if half == 0 { return vec![F::zero(); points_len]; }
 
-                // Precompute t values once per round
-                let t_vals: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
-                let t_len = t_vals.len();
+                // Precompute evaluation points once per round
+                let eval_points: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
+                let num_eval_points = eval_points.len();
 
                 // Non-tiled single-pass: parallel fold directly over j for clean comparison to tiled streaming.
                 let (h0_total, ht_total, _scratch_prod) = (0..half)
                     .into_par_iter()
                     .fold(
-                        || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                        || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
                         |(mut h0_acc, mut ht_acc, mut prod_t_acc), j| {
                             // Compute a,m for each polynomial; multiply into h(0) and all h(t)
                             let mut prod_a = F::one();
@@ -110,32 +111,32 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                 let b = poly.Z[2 * j + 1];
                                 let m = b - a;
                                 prod_a = prod_a * a;
-                                if t_len > 0 {
-                                    let mut v_t = a + m * t_vals[0];
+                                if num_eval_points > 0 {
+                                    let mut v_t = a + m * eval_points[0];
                                     prod_t_acc[0] = prod_t_acc[0] * v_t;
-                                    for idx in 1..t_len {
+                                    for idx in 1..num_eval_points {
                                         v_t = v_t + m;
                                         prod_t_acc[idx] = prod_t_acc[idx] * v_t;
                                     }
                                 }
                             }
                             h0_acc = h0_acc + prod_a;
-                            for idx in 0..t_len { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                            for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
                             for v in &mut prod_t_acc { *v = F::one(); }
                             (h0_acc, ht_acc, prod_t_acc)
                         },
                     )
                     .reduce(
-                        || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                        || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
                         |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
-                            for i in 0..t_len { ht_a[i] = ht_a[i] + ht_b[i]; }
-                            (h0_a + h0_b, ht_a, vec![F::one(); t_len])
+                            for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
+                            (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points])
                         },
                     );
 
                 let mut evals_at_points = vec![F::zero(); points_len];
                 evals_at_points[0] = h0_total;
-                for idx in 0..t_len { evals_at_points[idx + 1] = ht_total[idx]; }
+                for idx in 0..num_eval_points { evals_at_points[idx + 1] = ht_total[idx]; }
                 evals_at_points
             }
             ExecutionMode::Tiling => {
@@ -154,8 +155,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                     let half_before = len_before / 2;
                     let degree = this.degree; // number of polynomials
                     let points_len = 1 + (degree.saturating_sub(1));
-                    let t_vals = &s.t_vals; // t in [2..=degree]
-                    let t_len = t_vals.len();
+                    let eval_points = &s.eval_points; // t in [2..=degree]
+                    let num_eval_points = eval_points.len();
                     let num_polys = working.len();
                     if half_before == 0 { return vec![F::zero(); points_len]; }
 
@@ -175,9 +176,9 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         let mut next_polys = s
                             .next_polys
                             .take()
-                            .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect());
+                            .unwrap_or_else(|| (0..num_polys).map(|_| DensePolynomial::new(unsafe_allocate_zero_vec(half_before))).collect());
                         if next_polys.len() != num_polys {
-                            next_polys = (0..num_polys).map(|_| DensePolynomial::new(vec![F::zero(); half_before])).collect();
+                            next_polys = (0..num_polys).map(|_| DensePolynomial::new(unsafe_allocate_zero_vec(half_before))).collect();
                         }
                         for p in 0..num_polys {
                             if next_polys[p].len() != half_before {
@@ -198,7 +199,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         let (h0_total, ht_total, _worker_scratch) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
                                 |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
@@ -230,17 +231,17 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                                 let y1 = unsafe { dst_base.add(j1).read() };
                                                 let m2 = y1 - y0;
                                                 prod_a = prod_a * y0;
-                                                if t_len > 0 {
-                                                    let mut v_t = y0 + m2 * t_vals[0];
+                                                if num_eval_points > 0 {
+                                                    let mut v_t = y0 + m2 * eval_points[0];
                                                     prod_t_acc[0] = prod_t_acc[0] * v_t;
-                                                    for idx in 1..t_len {
+                                                    for idx in 1..num_eval_points {
                                                         v_t = v_t + m2;
                                                         prod_t_acc[idx] = prod_t_acc[idx] * v_t;
                                                     }
                                                 }
                                             }
                                             h0_acc = h0_acc + prod_a;
-                                            for idx in 0..t_len { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                                            for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
                                             for v in &mut prod_t_acc { *v = F::one(); }
                                         }
                                     }
@@ -248,10 +249,10 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                 },
                             )
                             .reduce(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
                                 |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
-                                    for i in 0..t_len { ht_a[i] = ht_a[i] + ht_b[i]; }
-                                    (h0_a + h0_b, ht_a, vec![F::one(); t_len])
+                                    for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
+                                    (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points])
                                 },
                             );
 
@@ -266,7 +267,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
                                 |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
@@ -277,27 +278,27 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                             let b = poly.Z[2 * j + 1];
                                             let m = b - a;
                                             prod_a = prod_a * a;
-                                            if t_len > 0 {
-                                                let mut v_t = a + m * t_vals[0];
+                                        if num_eval_points > 0 {
+                                                let mut v_t = a + m * eval_points[0];
                                                 prod_t_acc[0] = prod_t_acc[0] * v_t;
-                                                for idx in 1..t_len {
+                                                for idx in 1..num_eval_points {
                                                     v_t = v_t + m;
                                                     prod_t_acc[idx] = prod_t_acc[idx] * v_t;
                                                 }
                                             }
                                         }
                                         h0_acc = h0_acc + prod_a;
-                                        for idx in 0..t_len { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                                        for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
                                         for v in &mut prod_t_acc { *v = F::one(); }
                                     }
                                     (h0_acc, ht_acc, prod_t_acc)
                                 },
                             )
                             .reduce(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                                || (F::zero(), vec![F::zero(); num_eval_points], vec![F::one(); num_eval_points]),
                                 |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
-                                    for i in 0..t_len { ht_a[i] = ht_a[i] + ht_b[i]; }
-                                    (h0_a + h0_b, ht_a, vec![F::one(); t_len])
+                                    for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
+                                    (h0_a + h0_b, ht_a, vec![F::one(); num_eval_points])
                                 },
                             );
 

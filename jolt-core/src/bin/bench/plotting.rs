@@ -132,9 +132,11 @@ pub fn draw_all_charts(
     let out_tile = std::path::Path::new(out_path).with_file_name("bench_by_tile_len.png");
     let root3 = BitMapBackend::new(out_tile.to_str().unwrap(), (1280, 720)).into_drawing_area();
     root3.fill(&WHITE).unwrap();
-    let tile_min = rows.iter().filter(|r| r.3 != 0).map(|r| r.3).min().unwrap_or(0) as i32;
-    let tile_max = rows.iter().map(|r| r.3).max().unwrap_or(0) as i32;
-    let y3_max = rows.iter().map(|r| r.9.max(r.10).max(r.11).max(r.12)).fold(0.0, f64::max) * 1.2;
+    // Only consider tiling series for tile_len chart
+    let tiling_rows: Vec<&Row> = rows.iter().filter(|r| r.3 != 0).collect();
+    let tile_min = tiling_rows.iter().map(|r| r.3).min().unwrap_or(0) as i32;
+    let tile_max = tiling_rows.iter().map(|r| r.3).max().unwrap_or(0) as i32;
+    let y3_max = tiling_rows.iter().map(|r| r.11).fold(0.0, f64::max) * 1.2;
     let mut chart3 = ChartBuilder::on(&root3)
         .caption("Sumcheck Proving Time (ms) — by tile_len", ("sans-serif", 24))
         .margin(20)
@@ -145,20 +147,14 @@ pub fn draw_all_charts(
     chart3.configure_mesh().x_desc("tile_len").y_desc("ms").draw().unwrap();
     for &d in d_list {
         for &thr in thread_variants {
-            let mut b_first: Vec<(i32, f64)> = Vec::new();
-            let mut b_prove: Vec<(i32, f64)> = Vec::new();
             let mut t_first: Vec<(i32, f64)> = Vec::new();
             let mut t_prove: Vec<(i32, f64)> = Vec::new();
-            for &(_t, dd, threads_here, tile_len, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct, _ibatch, _itiling) in rows.iter() {
+            for &(_t, dd, threads_here, tile_len, _gen, _pb, _pt, _tot, _thr_dup, _ib, _cb, it, ct, _ibatch, _itiling) in rows.iter() {
                 if dd == d && threads_here == thr && tile_len != 0 {
-                    b_first.push((tile_len as i32, ib));
-                    b_prove.push((tile_len as i32, cb));
                     t_first.push((tile_len as i32, it));
                     t_prove.push((tile_len as i32, ct));
                 }
             }
-            chart3.draw_series(LineSeries::new(b_first, &RED)).unwrap().label(format!("batch boot-kernel d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
-            chart3.draw_series(LineSeries::new(b_prove, &GREEN)).unwrap().label(format!("batch recursive-kernel d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
             chart3.draw_series(LineSeries::new(t_first, &BLUE)).unwrap().label(format!("tiling boot-kernel d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
             chart3.draw_series(LineSeries::new(t_prove, &MAGENTA)).unwrap().label(format!("tiling recursive-kernel d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
         }

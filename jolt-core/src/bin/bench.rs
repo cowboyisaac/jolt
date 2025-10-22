@@ -204,27 +204,26 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
         pool.install(|| {
             for &t in &t_list {
                 for &d in &d_list {
+                    let gen_start = Instant::now();
+                    let polys_base = build_random_dense_polys::<Fr>(t, d, "fun");
+                    let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+                    // Run batch once per (t,d,threads)
+                    let batch_clone = polys_base.clone();
+                    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(batch_clone);
+
                     for &tile_len in &tile_len_variants {
                         let overall_start = Instant::now();
-                        let gen_start = Instant::now();
-                        let polys = build_random_dense_polys::<Fr>(t, d, "fun");
-                        let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-                        let clone_start = Instant::now();
-                        let polys_clone = polys.clone();
-                        let _clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
-                        let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(polys_clone);
                         let tile_len_opt = if tile_len == 0 { None } else { Some(tile_len) };
-                        let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, tile_len_opt);
+                        // Clone per tile_len for tiling runs
+                        let polys_for_tiling = polys_base.clone();
+                        let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys_for_tiling, tile_len_opt);
                         let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
                         let threads_here = rayon::current_num_threads();
-                        // total proving times (unused here but available if needed):
-                        // let total_proving_batch = boot_batch_ms + recur_batch_ms;
-                        // let total_proving_tiling = boot_tiling_ms + recur_tiling_ms;
                         println!(
-                        "T={}, d={}, threads={}, tile_len={}:\n  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling: total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | total(all)={:.2}ms",
-                        t, d, threads_here, tile_len_opt.unwrap_or(0),
+                        "T={}, d={}, threads={}\n  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling (tile_len={}): total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | total(all)={:.2}ms",
+                        t, d, threads_here,
                         t_batch, boot_batch_ms, recur_batch_ms, claim_batch == claim_tiling,
-                        t_tiling, boot_tiling_ms, recur_tiling_ms, overall_ms
+                        tile_len_opt.unwrap_or(0), t_tiling, boot_tiling_ms, recur_tiling_ms, overall_ms
                         );
                         rows.push((t, d, threads_here, tile_len_opt.unwrap_or(0), gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
                     }
