@@ -38,17 +38,7 @@ pub struct TilingState<F: JoltField> {
 }
 
 impl<F: JoltField> TilingState<F> {
-    fn compute_tile_len(degree: usize, l1_bytes: usize) -> usize {
-        let elem_bytes: usize = core::mem::size_of::<F>().max(32); // BN254 ~32 bytes
-        let d = degree.max(1);
-        let mut tile_len = (l1_bytes / (d * elem_bytes)).max(64);
-        tile_len = tile_len.min(2048);
-        let pow = usize::BITS - 1 - tile_len.leading_zeros();
-        1usize << pow
-    }
-
-    fn new(degree: usize, l1_bytes: usize) -> Self {
-        let tile_len = Self::compute_tile_len(degree, l1_bytes);
+    fn new_with_tile_len(degree: usize, tile_len: usize) -> Self {
         let t_vals: Vec<F> = (2..=degree).map(|t| F::from_u64(t as u64)).collect();
         Self {
             tile_len,
@@ -60,13 +50,16 @@ impl<F: JoltField> TilingState<F> {
 }
 
 impl<F: JoltField> ProductSumcheck<F> {
-    pub fn from_polynomials_mode(polynomials: Vec<DensePolynomial<F>>, mode: ExecutionMode, l1_kb: Option<usize>) -> Self {
+    pub fn from_polynomials_mode(
+        polynomials: Vec<DensePolynomial<F>>,
+        mode: ExecutionMode,
+        tile_len_override: Option<usize>,
+    ) -> Self {
         let n = polynomials.get(0).map(|p| p.len()).unwrap_or(0);
         let log_n = if n == 0 { 0 } else { n.trailing_zeros() as usize };
         let degree = polynomials.len();
         let original_polynomials = polynomials.clone();
         // Compute input_claim using a simple parallel map-reduce over i (no tiling) for apples-to-apples.
-        let l1_bytes_cfg = l1_kb.map(|kb| kb * 1024).unwrap_or(32 * 1024);
         let input_t0 = Instant::now();
         let input_claim = (0..n)
             .into_par_iter()
@@ -76,7 +69,9 @@ impl<F: JoltField> ProductSumcheck<F> {
 
         let tiling = match mode {
             ExecutionMode::Batch => None,
-            ExecutionMode::Tiling => Some(TilingState::new(degree, l1_bytes_cfg)),
+            ExecutionMode::Tiling => {
+                Some(TilingState::new_with_tile_len(degree, tile_len_override.unwrap_or(0)))
+            }
         };
         Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling, input_claim_ms: input_ms, boot_kernel_ms: 0.0, recursive_kernel_ms: 0.0 }
     }

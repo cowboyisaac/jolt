@@ -13,31 +13,31 @@ cargo run --release -p jolt-core --bin bench -- [COMMAND] [OPTIONS]
 
 ### Run Single Experiment
 ```bash
-cargo run --release -p jolt-core --bin bench -- run --T 10 --d 2 --mode 0 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- run --T 10 --d 2 --mode 0 --tile-len 256
 ```
 
 **Options:**
 - `-T, --T <T>`: Size of sumcheck (2^T), default: 10
 - `-d, --d <D>`: Degree of polynomial, default: 2  
-- `-m, --mode <MODE>`: Mode to run (0=Batch, 1=Streaming), default: 0
-- `--l1-kb <KB>`: L1 data cache size in kB for tile sizing, default: 32
+- `-m, --mode <MODE>`: Mode to run (0=Batch, 1=Tiling), default: 0
+- `--tile-len <N>`: Tile length (pairs per tile) for tiling mode. If omitted, a heuristic is used.
 - `--threads <N>`: Override rayon threads for this run (e.g., `--threads 16`).
 
 ### Compare Implementations
 ```bash
-cargo run --release -p jolt-core --bin bench -- compare --T 10 --d 2 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- compare --T 10 --d 2 --tile-len 256
 ```
 
 **Options:**
 - `-T, --T <T>`: Size of sumcheck (2^T), default: 10
 - `-d, --d <D>`: Degree of polynomial, default: 2
-- `--l1-kb <KB>`: L1 data cache size in kB for tile sizing, default: 32
+- `--tile-len <N>`: Tile length (pairs per tile) for tiling mode. If omitted, a heuristic is used.
 - `--threads <N>`: Override rayon threads for this run (e.g., `--threads 16`).
 
 ### Batch Experiments
 Run a grid of experiments over T and d:
 ```bash
-cargo run --release -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --l1-kb 64 --threads 8,16,32
+cargo run --release -p jolt-core --bin bench -- batch --T 15,20,24 --d 2,3,4 --tile-len 128,256,512 --threads 8,16,32
 ```
 
 Batch mode iterates over each thread count and runs the full grid for every `T × d`. Logs include the selected `threads` value for each run. The chart now separates phases: it draws four series per `(d, threads)` pair — `batch first_sum`, `batch prove`, `tiling first_sum`, and `tiling prove` — so you can see phase-level scaling.
@@ -45,7 +45,7 @@ Batch mode iterates over each thread count and runs the full grid for every `T �
 ## Modes
 
 - **Mode 0 - Batch**: Uses `SingleSumcheck` with `ProductSumcheck` in batch mode; input_claim uses a parallel map-reduce over i (no tiling), mirroring baseline behavior.
-- **Mode 1 - Tiling**: Uses `SingleSumcheck` with `ProductSumcheck` in tiling mode; input_claim uses a partition-friendly tiled fold/reduce with tile_len derived from `--l1-kb`.
+- **Mode 1 - Tiling**: Uses `SingleSumcheck` with `ProductSumcheck` in tiling mode; input_claim uses a partition-friendly tiled fold/reduce with `--tile-len` if provided, or an internal heuristic when omitted.
 
 ## Implementation Details
 
@@ -66,13 +66,11 @@ The tool uses deterministic pseudo-random data generation with seed "fun":
 - This ensures reproducible results across runs
 - Different modes use the same random data for fair comparison
 
-## Tiling and L1 sizing
+## Tiling
 
-- Tiling uses tiled evaluation to improve cache locality. Tile length is derived from the configured L1 size:
-  - `tile_len ≈ L1_bytes / (degree * elem_bytes)`, clamped to [64, 512] and rounded to a power of two.
-  - `--l1-kb` sets L1_bytes = KB * 1024; default is 32 KiB.
-  - Deferred binding: bind() records the next challenge; at the start of compute, the instance applies the pending challenge to produce halved polynomials, then computes the product-sum evaluations.
-  - Big-endian normalization is used for opening points and final claim evaluation, consistent with the codebase.
+- Tiling uses tiled evaluation to improve cache locality. You can control the tile length directly with `--tile-len` (pairs per tile). If not provided, a reasonable heuristic is used.
+- Deferred binding: bind() records the next challenge; at the start of compute, the instance applies the pending challenge to produce halved polynomials, then computes the product-sum evaluations.
+- Big-endian normalization is used for opening points and final claim evaluation, consistent with the codebase.
 
 ## Output
 
@@ -82,25 +80,14 @@ The tool prints timing information including:
 - For Compare: total, `first_sum` and `prove` times for Batch and Tiling, per-thread throughput, and speedup (Batch/Tiling)
 - For Batch: per-run `first_sum` and `prove` times for both implementations, with the `threads` value included in each log line; the generated chart shows separate series for each `(d, threads)` pair
 
-## Credibility
-
-This tool uses the actual Jolt `SingleSumcheck` abstraction and infrastructure:
-- Real `SingleSumcheck::prove()` and `SingleSumcheck::verify()` methods
-- Proper `SumcheckInstance` trait implementation
-- Authentic polynomial evaluation and binding methods from the Jolt codebase
-- Real transcript implementation for challenge generation
-- Correct field arithmetic and challenge types
-
-This makes the experiments highly credible and representative of actual Jolt sumcheck performance characteristics.
-
 ## Examples
 ```bash
 # Single run
-cargo run --release -p jolt-core --bin bench -- run --T 18 --d 3 --mode 0 --l1-kb 64
+cargo run --release -p jolt-core --bin bench -- run --T 18 --d 3 --mode 1 --tile-len 256
 
-# Compare batch vs streaming for a single setting
-cargo run --release -p jolt-core --bin bench -- compare --T 24 --d 2 --l1-kb 64 --threads 16
+# Compare batch vs tiling for a single setting
+cargo run --release -p jolt-core --bin bench -- compare --T 24 --d 2 --tile-len 256 --threads 16
 
 # Batch grid
-cargo run --release -p jolt-core --bin bench -- batch --T 20,22 --d 2,3 --l1-kb 64 --threads 4, 8,16
+cargo run --release -p jolt-core --bin bench -- batch --T 20,22 --d 2,3 --tile-len 128,256 --threads 8,16
 ```

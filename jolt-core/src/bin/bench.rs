@@ -2,9 +2,13 @@ use clap::{Parser, Subcommand};
 use ark_bn254::Fr;
 use std::time::Instant;
 use rayon::prelude::*;
-use plotters::prelude::*;
+
+// plotting moved to plotting.rs
 
 mod product_sumcheck;
+mod bench {
+    pub mod plotting;
+}
 use jolt_core::field::JoltField;
 use jolt_core::poly::dense_mlpoly::DensePolynomial;
 use jolt_core::subprotocols::sumcheck::SingleSumcheck;
@@ -37,9 +41,9 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         mode: u32,
 
-        /// L1 data cache size in kB for tile sizing (streaming). Default 32.
-        #[arg(long = "l1-kb", default_value = "32")]
-        l1_kb: usize,
+        /// Tile length (number of pairs per tile). If omitted, uses default heuristic.
+        #[arg(long = "tile-len")]
+        tile_len: Option<usize>,
 
         /// Number of Rayon threads to use (overrides RAYON_NUM_THREADS)
         #[arg(long = "threads")]
@@ -54,9 +58,9 @@ enum Commands {
         /// Degree of the polynomial
         #[arg(short, long, default_value = "2")]
         d: u32,
-        /// L1 data cache size in kB for tile sizing (streaming). Default 32.
-        #[arg(long = "l1-kb", default_value = "32")]
-        l1_kb: usize,
+        /// Tile length (number of pairs per tile). If omitted, uses default heuristic.
+        #[arg(long = "tile-len")]
+        tile_len: Option<usize>,
 
         /// Number of Rayon threads to use (overrides RAYON_NUM_THREADS)
         #[arg(long = "threads")]
@@ -70,15 +74,15 @@ enum Commands {
         /// Degrees d. Comma-separated list, e.g. 2,3,4
         #[arg(long = "d", value_delimiter = ',', required = true)]
         d_list: Vec<u32>,
-        /// L1 data cache size in kB for tile sizing (streaming). Default 32.
-        #[arg(long = "l1-kb", default_value = "32")]
-        l1_kb: usize,
         /// Output image path (PNG/JPG). Relative paths are written to the current directory.
         #[arg(long = "out", default_value = "./bench_results.png")]
         out_path: String,
         /// Comma-separated list of thread counts to test, e.g. 8,16,32. If omitted, uses current default.
         #[arg(long = "threads", value_delimiter = ',')]
         threads: Option<Vec<usize>>,
+        /// Comma-separated list of tile lengths to test.
+        #[arg(long = "tile-len", value_delimiter = ',')]
+        tile_lens: Option<Vec<usize>>,
     },
 }
 
@@ -86,37 +90,37 @@ fn main() {
     let cli = Cli::parse();
     
     match cli.command {
-        Commands::Run { t, d, mode, l1_kb, threads } => {
+        Commands::Run { t, d, mode, tile_len, threads } => {
             if let Some(n) = threads { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
-            run_single_experiment(t, d, mode, l1_kb)
+            run_single_experiment(t, d, mode, tile_len)
         }
-        Commands::Compare { t, d, l1_kb, threads } => {
+        Commands::Compare { t, d, tile_len, threads } => {
             if let Some(n) = threads { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
-            match compare_implementations(t, d, l1_kb) {
+            match compare_implementations(t, d, tile_len) {
                 Ok(()) => println!("\nCompare finished successfully."),
                 Err(e) => eprintln!("\nCompare failed: {}", e),
             }
         }
-        Commands::Batch { t_list, d_list, l1_kb, out_path, threads } => {
-            run_batch_experiments(t_list, d_list, l1_kb, out_path, threads);
+        Commands::Batch { t_list, d_list, out_path, threads, tile_lens } => {
+            run_batch_experiments(t_list, d_list, out_path, threads, tile_lens);
         }
     }
 }
 
 // Threads are auto-managed by rayon now.
 
-fn run_single_experiment(t: u32, d: u32, mode: u32, l1_kb: usize) {
+fn run_single_experiment(t: u32, d: u32, mode: u32, tile_len: Option<usize>) {
     println!("Running sumcheck experiment: T={}, d={}, mode={}", t, d, mode);
     let total_start = Instant::now();
     let gen_start = Instant::now();
     let polys = build_random_dense_polys::<Fr>(t, d, "fun");
     let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
     let (claim, total_proving_ms, boot_ms, recur_ms, input_ms) = match mode {
-        0 => timed_batch::<Fr>(polys, l1_kb),
-        1 => timed_tiling_with_polys::<Fr>(polys, l1_kb),
+        0 => timed_batch::<Fr>(polys),
+        1 => timed_tiling_with_polys::<Fr>(polys, tile_len),
         _ => {
             println!("Unknown mode {}, falling back to mode 0", mode);
-            timed_batch::<Fr>(build_random_dense_polys::<Fr>(t, d, "fun"), l1_kb)
+            timed_batch::<Fr>(build_random_dense_polys::<Fr>(t, d, "fun"))
         }
     };
     let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -134,7 +138,7 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, l1_kb: usize) {
     );
 }
 
-fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn compare_implementations(t: u32, d: u32, tile_len: Option<usize>) -> Result<(), Box<dyn std::error::Error>> {
     println!("Comparing sumcheck implementations: T={}, d={}", t, d);
     let overall_start = Instant::now();
     let gen_start = Instant::now();
@@ -145,8 +149,8 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
     let polys_clone = polys.clone();
     let clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
 
-    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, _input_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
-    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, _input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
+    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, _input_batch_ms) = timed_batch::<Fr>(polys_clone);
+    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, _input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, tile_len);
 
     let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     let accounted = gen_ms + clone_ms + t_batch + t_tiling;
@@ -190,176 +194,47 @@ fn compare_implementations(t: u32, d: u32, l1_kb: usize) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, l1_kb: usize, out_path: String, threads: Option<Vec<usize>>) {
+fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, threads: Option<Vec<usize>>, tile_lens: Option<Vec<usize>>) {
     let thread_variants: Vec<usize> = if let Some(v) = threads { if v.is_empty() { vec![rayon::current_num_threads()] } else { v } } else { vec![rayon::current_num_threads()] };
-    println!("Batch experiments: Ts={:?}, ds={:?}, threads={:?}", t_list, d_list, thread_variants);
-    let mut rows: Vec<(u32, u32, usize, f64, f64, f64, f64, usize, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    let tile_len_variants: Vec<usize> = if let Some(v) = tile_lens { if v.is_empty() { vec![0usize] } else { v } } else { vec![0usize] };
+    println!("Batch experiments: Ts={:?}, ds={:?}, threads={:?}, tile_lens={:?}", t_list, d_list, thread_variants, tile_len_variants);
+    let mut rows: Vec<(u32, u32, usize, usize, f64, f64, f64, f64, usize, f64, f64, f64, f64, f64, f64)> = Vec::new();
     for &thr in &thread_variants {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(thr).build().expect("build thread pool");
         pool.install(|| {
             for &t in &t_list {
                 for &d in &d_list {
-                    let overall_start = Instant::now();
-                    let gen_start = Instant::now();
-                    let polys = build_random_dense_polys::<Fr>(t, d, "fun");
-                    let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-                    let clone_start = Instant::now();
-                    let polys_clone = polys.clone();
-                    let _clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
-                    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(polys_clone, l1_kb);
-                    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, l1_kb);
-                    let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
-                    let threads_here = rayon::current_num_threads();
-                    let total_proving_batch = boot_batch_ms + recur_batch_ms;
-                    let total_proving_tiling = boot_tiling_ms + recur_tiling_ms;
-                    let _speedup = if total_proving_tiling > 0.0 { total_proving_batch / total_proving_tiling } else { 0.0 };
-                    println!(
-                        "T={}, d={}, threads={}:\n  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling: total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | total(all)={:.2}ms",
-                        t, d, threads_here,
+                    for &tile_len in &tile_len_variants {
+                        let overall_start = Instant::now();
+                        let gen_start = Instant::now();
+                        let polys = build_random_dense_polys::<Fr>(t, d, "fun");
+                        let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+                        let clone_start = Instant::now();
+                        let polys_clone = polys.clone();
+                        let _clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
+                        let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(polys_clone);
+                        let tile_len_opt = if tile_len == 0 { None } else { Some(tile_len) };
+                        let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, tile_len_opt);
+                        let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
+                        let threads_here = rayon::current_num_threads();
+                        // total proving times (unused here but available if needed):
+                        // let total_proving_batch = boot_batch_ms + recur_batch_ms;
+                        // let total_proving_tiling = boot_tiling_ms + recur_tiling_ms;
+                        println!(
+                        "T={}, d={}, threads={}, tile_len={}:\n  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling: total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | total(all)={:.2}ms",
+                        t, d, threads_here, tile_len_opt.unwrap_or(0),
                         t_batch, boot_batch_ms, recur_batch_ms, claim_batch == claim_tiling,
                         t_tiling, boot_tiling_ms, recur_tiling_ms, overall_ms
-                    );
-                    rows.push((t, d, threads_here, gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
+                        );
+                        rows.push((t, d, threads_here, tile_len_opt.unwrap_or(0), gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
+                    }
                 }
             }
         });
     }
 
-    // Chart 1: by trace size (T)
-    let root = BitMapBackend::new(&out_path, (1280, 720)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-    let y_max = rows.iter()
-        .map(|r| r.8.max(r.9).max(r.10).max(r.11))
-        .fold(0.0, f64::max) * 1.2;
-    let t_min = *t_list.iter().min().unwrap_or(&0) as i32;
-    let t_max = *t_list.iter().max().unwrap_or(&0) as i32;
-    let mut chart = ChartBuilder::on(&root)
-        .caption(
-            format!("Sumcheck Proving Time (ms) — L1={}kB, threads={:?}", l1_kb, thread_variants),
-            ("sans-serif", 24)
-        )
-        .margin(20)
-        .x_label_area_size(40)
-        .y_label_area_size(60)
-        .build_cartesian_2d(
-            (t_min - 1)..(t_max + 1),
-            0f64..y_max
-        )
-        .unwrap();
-
-    chart.configure_mesh().x_desc("T").y_desc("ms").draw().unwrap();
-
-    for &d in &d_list {
-        for &thr in &thread_variants {
-            let mut series_batch_first: Vec<(i32, f64)> = Vec::new();
-            let mut series_batch_prove: Vec<(i32, f64)> = Vec::new();
-            let mut series_tiling_first: Vec<(i32, f64)> = Vec::new();
-            let mut series_tiling_prove: Vec<(i32, f64)> = Vec::new();
-            for &(t, dd, threads_here, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct, _ibatch, _itiling) in rows.iter() {
-                if dd == d && threads_here == thr {
-                    series_batch_first.push((t as i32, ib));
-                    series_batch_prove.push((t as i32, cb));
-                    series_tiling_first.push((t as i32, it));
-                    series_tiling_prove.push((t as i32, ct));
-                }
-            }
-            chart
-                .draw_series(LineSeries::new(series_batch_first, &RED))
-                .unwrap()
-                .label(format!("batch boot-kernel d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
-
-            chart
-                .draw_series(LineSeries::new(series_batch_prove, &GREEN))
-                .unwrap()
-                .label(format!("batch recursive-kernel d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
-
-            chart
-                .draw_series(LineSeries::new(series_tiling_first, &BLUE))
-                .unwrap()
-                .label(format!("tiling boot-kernel d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
-
-            chart
-                .draw_series(LineSeries::new(series_tiling_prove, &MAGENTA))
-                .unwrap()
-                .label(format!("tiling recursive-kernel d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
-        }
-    }
-    chart
-        .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
-        .draw()
-        .unwrap();
-
-    root.present().unwrap();
-    println!("Output chart: {}", out_path);
-
-    // Chart 2: by threads (x-axis threads), one chart per d with all T values overlaid by phase
-    let out_threads = std::path::Path::new(&out_path)
-        .with_file_name("bench_by_threads.png");
-    let root2 = BitMapBackend::new(out_threads.to_str().unwrap(), (1280, 720)).into_drawing_area();
-    root2.fill(&WHITE).unwrap();
-    let threads_min = *thread_variants.iter().min().unwrap_or(&1) as i32;
-    let threads_max = *thread_variants.iter().max().unwrap_or(&1) as i32;
-    let y2_max = rows.iter()
-        .map(|r| r.8.max(r.9).max(r.10).max(r.11))
-        .fold(0.0, f64::max) * 1.2;
-    let mut chart2 = ChartBuilder::on(&root2)
-        .caption(
-            format!("Sumcheck Proving Time (ms) — by threads, L1={}kB, Ts={:?}", l1_kb, t_list),
-            ("sans-serif", 24)
-        )
-        .margin(20)
-        .x_label_area_size(40)
-        .y_label_area_size(60)
-        .build_cartesian_2d(
-            (threads_min - 1)..(threads_max + 1),
-            0f64..y2_max
-        )
-        .unwrap();
-
-    chart2.configure_mesh().x_desc("threads").y_desc("ms").draw().unwrap();
-
-    for &d in &d_list {
-        for &t in &t_list {
-            let mut b_first: Vec<(i32, f64)> = Vec::new();
-            let mut b_prove: Vec<(i32, f64)> = Vec::new();
-            let mut t_first: Vec<(i32, f64)> = Vec::new();
-            let mut t_prove: Vec<(i32, f64)> = Vec::new();
-            for &(tt, dd, threads_here, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct, _ibatch, _itiling) in rows.iter() {
-                if dd == d && tt == t {
-                    b_first.push((threads_here as i32, ib));
-                    b_prove.push((threads_here as i32, cb));
-                    t_first.push((threads_here as i32, it));
-                    t_prove.push((threads_here as i32, ct));
-                }
-            }
-            chart2.draw_series(LineSeries::new(b_first, &RED)).unwrap()
-                .label(format!("batch boot-kernel d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
-            chart2.draw_series(LineSeries::new(b_prove, &GREEN)).unwrap()
-                .label(format!("batch recursive-kernel d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
-            chart2.draw_series(LineSeries::new(t_first, &BLUE)).unwrap()
-                .label(format!("tiling boot-kernel d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
-            chart2.draw_series(LineSeries::new(t_prove, &MAGENTA)).unwrap()
-                .label(format!("tiling recursive-kernel d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
-        }
-    }
-    chart2
-        .configure_series_labels()
-        .background_style(&WHITE.mix(0.8))
-        .border_style(&BLACK)
-        .draw()
-        .unwrap();
-    root2.present().unwrap();
-    println!("Wrote chart: {}", out_threads.to_str().unwrap());
+    // Draw charts using the plotting module
+    bench::plotting::draw_all_charts(&rows, &t_list, &d_list, &thread_variants, &out_path);
 }
 
 // ------------ Helpers moved from impl -------------
@@ -418,9 +293,9 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
 // Presume they should return input_ms and compute_ms as f64
 // Adjust the helpers accordingly so calling sites work.
 
-fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64, f64) {
+fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64, f64, f64, f64) {
     let start = Instant::now();
-    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Batch, Some(l1_kb));
+    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Batch, None);
 
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p, _c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
@@ -428,9 +303,9 @@ fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F
     (sumcheck.input_claim, total_ms, sumcheck.boot_kernel_ms, sumcheck.recursive_kernel_ms, sumcheck.input_claim_ms)
 }
 
-fn timed_tiling_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, l1_kb: usize) -> (F, f64, f64, f64, f64) {
+fn timed_tiling_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, tile_len: Option<usize>) -> (F, f64, f64, f64, f64) {
     let start = Instant::now();
-    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Tiling, Some(l1_kb));
+    let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Tiling, tile_len);
 
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p, _c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
