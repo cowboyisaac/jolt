@@ -289,13 +289,14 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
                                     for j in start..end {
+                                        // compute prod_a for round 0 directly from current arrays
                                         let mut prod_a = F::one();
                                         for poly in working.iter() {
                                             let a = poly.Z[2 * j];
                                             let b = poly.Z[2 * j + 1];
                                             let m = b - a;
                                             prod_a = prod_a * a;
-                                        if num_eval_points > 0 {
+                                            if num_eval_points > 0 {
                                                 let mut v_t = a + m * eval_points[0];
                                                 prod_t_acc[0] = prod_t_acc[0] * v_t;
                                                 for idx in 1..num_eval_points {
@@ -319,7 +320,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                 },
                             );
 
-                        evals_at_points[0] = evals_at_points[0] + h0_total;
+                        evals_at_points[0] = h0_total;
                         for idx in 0..ht_total.len() { evals_at_points[idx + 1] = evals_at_points[idx + 1] + ht_total[idx]; }
                     }
 

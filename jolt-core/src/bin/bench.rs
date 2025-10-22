@@ -166,9 +166,14 @@ fn compare_implementations(t: u32, d: u32, tile_len: Option<usize>) -> Result<()
         t_batch, boot_batch_ms, recur_batch_ms, claim_batch, claim_batch == claim_tiling
     );
     println!(
-        "  Tiling: total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms",
+        "  Tiling{}: total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms",
+        tile_len.map(|v| format!(" (tile_len={})", v)).unwrap_or_default(),
         t_tiling, boot_tiling_ms, recur_tiling_ms,
     );
+    let sp_total = if t_tiling > 0.0 { t_batch / t_tiling } else { 0.0 };
+    let sp_boot = if boot_tiling_ms > 0.0 { boot_batch_ms / boot_tiling_ms } else { 0.0 };
+    let sp_recur = if recur_tiling_ms > 0.0 { recur_batch_ms / recur_tiling_ms } else { 0.0 };
+    println!("  Speedup (batch/tiling): total={:.2}x | boot={:.2}x | recur={:.2}x", sp_total, sp_boot, sp_recur);
     println!(
         "  Time breakdown: gen={:.2}ms | clone={:.2}ms | overhead={:.2}ms",
         gen_ms, clone_ms, overhead_ms
@@ -219,11 +224,20 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
                         let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys_for_tiling, tile_len_opt);
                         let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
                         let threads_here = rayon::current_num_threads();
+                        let tile_len_val = tile_len_opt.unwrap_or(0);
                         println!(
-                        "T={}, d={}, threads={}\n  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling (tile_len={}): total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | total(all)={:.2}ms",
-                        t, d, threads_here,
+                        "T={}, d={}, threads={}, tile_len={}\n  Batch:  total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling (tile_len={}): total={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | total(all)={:.2}ms",
+                        t, d, threads_here, tile_len_val,
                         t_batch, boot_batch_ms, recur_batch_ms, claim_batch == claim_tiling,
-                        tile_len_opt.unwrap_or(0), t_tiling, boot_tiling_ms, recur_tiling_ms, overall_ms
+                        tile_len_val, t_tiling, boot_tiling_ms, recur_tiling_ms, overall_ms
+                        );
+                        // Per-phase speedups (batch / tiling)
+                        let sp_total = if t_tiling > 0.0 { t_batch / t_tiling } else { 0.0 };
+                        let sp_boot = if boot_tiling_ms > 0.0 { boot_batch_ms / boot_tiling_ms } else { 0.0 };
+                        let sp_recur = if recur_tiling_ms > 0.0 { recur_batch_ms / recur_tiling_ms } else { 0.0 };
+                        println!(
+                            "  Speedup (batch/tiling): total={:.2}x | boot={:.2}x | recur={:.2}x",
+                            sp_total, sp_boot, sp_recur
                         );
                         rows.push((t, d, threads_here, tile_len_opt.unwrap_or(0), gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
                     }
