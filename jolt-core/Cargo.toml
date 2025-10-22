@@ -25,6 +25,7 @@ keywords = ["SNARK", "cryptography", "proofs", "zkVM"]
 [features]
 default = ["host"]
 tiling_prefetch = []
+tiling_nt = []
 host = [
     "dep:reqwest",
     "dep:tokio",

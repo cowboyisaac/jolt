@@ -53,6 +53,13 @@ Batch mode iterates over each thread count and runs the full grid for every `T Ã
       - `cargo run --release -p jolt-core --features tiling_prefetch --bin bench -- batch --T 22,24,26 --d 3 --tile-len 512`
   - If not specified or on non-x86_64 targets, prefetch code is not compiled.
 
+- Optional non-temporal stores (x86_64 only):
+  - Guarded by cargo feature `tiling_nt`. Enabled only on early/large rounds (current heuristic: current_level > 2^20).
+  - Enable with:
+    - `cargo run --release -p jolt-core --features tiling_nt --bin bench -- run --T 26 --d 2 --mode 1 --tile-len 256`
+  - Combine with prefetch:
+    - `--features tiling_prefetch,tiling_nt`
+
 - **Mode 0 - Batch**: Uses `SingleSumcheck` with `ProductSumcheck` in batch mode; input_claim uses a parallel map-reduce over i (no tiling), mirroring baseline behavior.
 - **Mode 1 - Tiling**: Uses `SingleSumcheck` with `ProductSumcheck` in tiling mode; input_claim uses a partition-friendly tiled fold/reduce with `--tile-len` if provided, or an internal heuristic when omitted.
 

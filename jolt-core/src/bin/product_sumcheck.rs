@@ -8,6 +8,8 @@ use jolt_core::utils::thread::unsafe_allocate_zero_vec;
 use smallvec::SmallVec;
 #[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
 use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+#[cfg(all(target_arch = "x86_64", feature = "tiling_nt"))]
+use core::arch::x86_64::{_mm_stream_si128, __m128i};
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -247,6 +249,19 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                                 let b = src[2 * j + 1];
                                                 let m = b - a;
                                                 let y = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
+                                                #[cfg(all(target_arch = "x86_64", feature = "tiling_nt"))]
+                                                unsafe {
+                                                    let use_nt_round = len_before > (1 << 20);
+                                                    if use_nt_round && core::mem::size_of::<F>() == 32 {
+                                                        let src_bytes = &y as *const F as *const __m128i;
+                                                        let dst_ptr = (dst_base.add(j)) as *mut __m128i;
+                                                        _mm_stream_si128(dst_ptr, *src_bytes);
+                                                        _mm_stream_si128(dst_ptr.add(1), *src_bytes.add(1));
+                                                    } else {
+                                                        dst_base.add(j).write(y);
+                                                    }
+                                                }
+                                                #[cfg(not(all(target_arch = "x86_64", feature = "tiling_nt")))]
                                                 unsafe { dst_base.add(j).write(y); }
                                                 if is_even {
                                                     prev_even[p_idx] = y;
