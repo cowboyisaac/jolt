@@ -115,7 +115,7 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, tile_len: Option<usize>) {
     let gen_start = Instant::now();
     let polys = build_random_dense_polys::<Fr>(t, d, "fun");
     let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-    let (claim, total_proving_ms, boot_ms, recur_ms, input_ms) = match mode {
+    let (claim, total_proving_ms, boot_ms, recur_ms, input_ms, _pr_ms, _pr_len) = match mode {
         0 => timed_batch::<Fr>(polys),
         1 => timed_tiling_with_polys::<Fr>(polys, tile_len),
         _ => {
@@ -149,8 +149,8 @@ fn compare_implementations(t: u32, d: u32, tile_len: Option<usize>) -> Result<()
     let polys_clone = polys.clone();
     let clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
 
-    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(polys_clone);
-    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys, tile_len);
+    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, per_round_batch_ms, per_round_batch_len) = timed_batch::<Fr>(polys_clone);
+    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms, per_round_tiling_ms, _per_round_tiling_len) = timed_tiling_with_polys::<Fr>(polys, tile_len);
 
     let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     let accounted = gen_ms + clone_ms + t_batch + t_tiling;
@@ -196,6 +196,21 @@ fn compare_implementations(t: u32, d: u32, tile_len: Option<usize>) -> Result<()
     );
     let speedup = if t_tiling > 0.0 { t_batch / t_tiling } else { 0.0 };
     println!("  Speedup (Batch/Tiling): {:.2}x", speedup);
+    // Per-round breakdown printed only in compare
+    let rounds = std::cmp::min(per_round_batch_ms.len(), per_round_tiling_ms.len());
+    if rounds > 0 {
+        println!("\nPer-round timings and speedup (by vector length before binding):");
+        println!("  {:>5} | {:>4} | {:>14} | {:>12} | {:>12} | {:>8}", "round", "t", "vec_len", "batch(ms)", "tiling(ms)", "speedup");
+        for r in 1..rounds {
+            // Length is identical across modes; use batch's recorded vector length
+            let vec_len = *per_round_batch_len.get(r).unwrap_or(&0);
+            let b = per_round_batch_ms[r];
+            let tl = per_round_tiling_ms[r];
+            let sp = if tl > 0.0 { b / tl } else { 0.0 };
+            let t_round = if vec_len > 0 { (usize::BITS as usize - 1) - (vec_len.leading_zeros() as usize) } else { 0 };
+            println!("  {:>5} | {:>4} | {:>14} | {:>12.2} | {:>12.2} | {:>7.2}x", r, t_round, vec_len, b, tl, sp);
+        }
+    }
     Ok(())
 }
 
@@ -214,14 +229,14 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
                     let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
                     // Run batch once per (t,d,threads)
                     let batch_clone = polys_base.clone();
-                    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms) = timed_batch::<Fr>(batch_clone);
+                    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, _pr_ms_b, _pr_len_b) = timed_batch::<Fr>(batch_clone);
 
                     for &tile_len in &tile_len_variants {
                         let overall_start = Instant::now();
                         let tile_len_opt = if tile_len == 0 { None } else { Some(tile_len) };
                         // Clone per tile_len for tiling runs
                         let polys_for_tiling = polys_base.clone();
-                        let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms) = timed_tiling_with_polys::<Fr>(polys_for_tiling, tile_len_opt);
+                        let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms, _pr_ms_t, _pr_len_t) = timed_tiling_with_polys::<Fr>(polys_for_tiling, tile_len_opt);
                         let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
                         let threads_here = rayon::current_num_threads();
                         let tile_len_val = tile_len_opt.unwrap_or(0);
@@ -306,22 +321,22 @@ fn build_random_dense_polys<F: JoltField>(t: u32, d: u32, seed: &str) -> Vec<Den
 // Presume they should return input_ms and compute_ms as f64
 // Adjust the helpers accordingly so calling sites work.
 
-fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64, f64, f64, f64) {
+fn timed_batch<F: JoltField>(polys: Vec<DensePolynomial<F>>) -> (F, f64, f64, f64, f64, Vec<f64>, Vec<usize>) {
     let start = Instant::now();
     let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Batch, None);
 
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p, _c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    (sumcheck.input_claim, total_ms, sumcheck.boot_kernel_ms, sumcheck.recursive_kernel_ms, sumcheck.input_claim_ms)
+    (sumcheck.input_claim, total_ms, sumcheck.boot_kernel_ms, sumcheck.recursive_kernel_ms, sumcheck.input_claim_ms, sumcheck.per_round_ms, sumcheck.per_round_len)
 }
 
-fn timed_tiling_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, tile_len: Option<usize>) -> (F, f64, f64, f64, f64) {
+fn timed_tiling_with_polys<F: JoltField>(polys: Vec<DensePolynomial<F>>, tile_len: Option<usize>) -> (F, f64, f64, f64, f64, Vec<f64>, Vec<usize>) {
     let start = Instant::now();
     let mut sumcheck = ProductSumcheck::from_polynomials_mode(polys, ExecutionMode::Tiling, tile_len);
 
     let mut transcript = Blake2bTranscript::new(b"sumcheck_experiment");
     let (_p, _c) = SingleSumcheck::prove::<F, Blake2bTranscript>(&mut sumcheck, None, &mut transcript);
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    (sumcheck.input_claim, total_ms, sumcheck.boot_kernel_ms, sumcheck.recursive_kernel_ms, sumcheck.input_claim_ms)
+    (sumcheck.input_claim, total_ms, sumcheck.boot_kernel_ms, sumcheck.recursive_kernel_ms, sumcheck.input_claim_ms, sumcheck.per_round_ms, sumcheck.per_round_len)
 }

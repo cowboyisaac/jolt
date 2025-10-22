@@ -33,6 +33,11 @@ pub struct ProductSumcheck<F: JoltField> {
     pub input_claim_ms: f64,
     pub boot_kernel_ms: f64,
     pub recursive_kernel_ms: f64,
+    // Per-round timings (ms) and working vector length before binding at that round
+    pub per_round_ms: Vec<f64>,
+    pub per_round_len: Vec<usize>,
+    // Scratch: bind duration from previous round to pair with next round's compute
+    pub pending_bind_ms: f64,
 }
 
 pub struct TilingState<F: JoltField> {
@@ -83,7 +88,9 @@ impl<F: JoltField> ProductSumcheck<F> {
                 Some(TilingState::new_with_tile_len(degree, tile_len_override.unwrap_or(0)))
             }
         };
-        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling, input_claim_ms: input_ms, boot_kernel_ms: 0.0, recursive_kernel_ms: 0.0 }
+        let per_round_ms = vec![0.0; log_n];
+        let per_round_len = vec![0usize; log_n];
+        Self { input_claim, polynomials, original_polynomials, log_n, degree, mode, tiling, input_claim_ms: input_ms, boot_kernel_ms: 0.0, recursive_kernel_ms: 0.0, per_round_ms, per_round_len, pending_bind_ms: 0.0 }
     }
 }
 
@@ -98,7 +105,15 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
             ExecutionMode::Batch => {
                 // Fused single-pass computation for h(0) and h(2..=degree) over j.
                 // We evaluate all t-values in one sweep while data are hot, avoiding (d-1) extra passes.
-                let half = self.polynomials[0].len() / 2;
+                let len_before = self.polynomials[0].len();
+                // For apples-to-apples against tiling (which binds+eval together),
+                // attribute this round's instance size as eval(len_before) + bind(len_before) = 2*len_before,
+                // except for the first round where bind is the first time and we measure just len_before.
+                if round > 0 {
+                    let logical_len_for_reporting = len_before.saturating_mul(2);
+                    self.per_round_len[round] = logical_len_for_reporting;
+                }
+                let half = len_before / 2;
                 let degree = self.degree;
                 let points_len = 1 + (degree.saturating_sub(1));
                 if half == 0 { return vec![F::zero(); points_len]; }
@@ -164,6 +179,12 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                     // Working view for this round
                     let working: &[DensePolynomial<F>] = &this.polynomials;
                     let len_before = working[0].len();
+                    // For tiling, we report the working polynomial length for this round.
+                    // Binding is deferred and applied within the tiled executor, so we keep it as len_before.
+                    if round > 0 {
+                        let logical_len = len_before;
+                        this.per_round_len[round] = logical_len;
+                    }
                     for (i, poly) in working.iter().enumerate() {
                         assert_eq!(poly.len(), len_before, "Polynomial {} has length {}, expected {}", i, poly.len(), len_before);
                     }
@@ -381,7 +402,14 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
             }
         };
         let dt = t0.elapsed().as_secs_f64() * 1000.0;
-        if round == 0 { self.boot_kernel_ms += dt; } else { self.recursive_kernel_ms += dt; }
+        if round == 0 {
+            self.boot_kernel_ms += dt;
+        } else {
+            self.recursive_kernel_ms += dt;
+            // Per-round time for recursive rounds: bind(prev) + compute(this)
+            self.per_round_ms[round] = self.pending_bind_ms + dt;
+            self.pending_bind_ms = 0.0;
+        }
         out
     }
 
@@ -400,6 +428,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
         // Count bind cost as part of recursive kernel timing (bind happens after boot round)
         let dt = t0.elapsed().as_secs_f64() * 1000.0;
         self.recursive_kernel_ms += dt;
+        // Store bind duration to be combined with next round's compute
+        self.pending_bind_ms = dt;
     }
 
     fn expected_output_claim(
