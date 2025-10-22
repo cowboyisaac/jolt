@@ -211,33 +211,32 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                             .map(|p| p.Z.as_mut_ptr() as usize)
                             .collect();
 
-                        // Parallel tiles with per-worker reusable tile buffers to avoid per-tile allocations.
-                        let (h0_total, ht_total, _scratch_prod, _worker_bufs) = (0..num_tiles)
+                        // Parallel tiles, single-pass direct write + accumulate: write y to next_round and
+                        // on odd j pair with previous even y kept in-register to update accumulators.
+                        // tile_len is enforced even, so each tile starts on an even j to avoid cross-tile pairing.
+                        let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
                             .into_par_iter()
                             .fold(
                                 || {
-                                    let tile_bufs: Vec<Vec<F>> = (0..num_polys)
-                                        .map(|_| unsafe_allocate_zero_vec(s.tile_len))
-                                        .collect();
                                     let mut sv_zero: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
                                     for _ in 0..num_eval_points { sv_zero.push(F::zero()); }
                                     let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
                                     for _ in 0..num_eval_points { sv_one.push(F::one()); }
-                                    (F::zero(), sv_zero, sv_one, tile_bufs)
+                                    (F::zero(), sv_zero, sv_one)
                                 },
-                                |(mut h0_acc, mut ht_acc, mut prod_t_acc, mut tile_bufs), tile_idx| {
+                                |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
                                     if start < end {
-                                        let cur_len = end - start;
-                                        // Fill buffers (only first cur_len entries are written)
-                                        for p_idx in 0..num_polys {
-                                            let src = &working[p_idx].Z;
-                                            let buf = &mut tile_bufs[p_idx];
-                                            debug_assert!(buf.len() >= cur_len);
-                                            for off in 0..cur_len {
-                                                let j = start + off;
-                                                // Prefetch future source elements to L1
+                                        // Keep previous even y per polynomial for pairing
+                                        let mut prev_even: Vec<F> = vec![F::zero(); num_polys];
+                                        for j in start..end {
+                                            let is_even = (j & 1) == 0;
+                                            let mut prod_a_pair = F::one();
+                                            for p_idx in 0..num_polys {
+                                                let src = &working[p_idx].Z;
+                                                let dst_base = base_addrs[p_idx] as *mut F;
+                                                // Prefetch future source lines
                                                 #[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
                                                 unsafe {
                                                     let pf_j = core::cmp::min(j + 32, len_before - 1);
@@ -247,72 +246,53 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                                 let a = src[2 * j];
                                                 let b = src[2 * j + 1];
                                                 let m = b - a;
-                                                buf[off] = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
-                                            }
-                                        }
-
-                                        // Accumulate from buffers using (j0,j1) within the tile
-                                        let k_start = (start + 1) >> 1;
-                                        let k_end = end >> 1;
-                                        for k in k_start..k_end {
-                                            let j0 = 2 * k;
-                                            let j1 = 2 * k + 1;
-                                            let off0 = j0 - start;
-                                            let off1 = j1 - start;
-                                            let mut prod_a = F::one();
-                                            for p_idx in 0..num_polys {
-                                                let y0 = tile_bufs[p_idx][off0];
-                                                let y1 = tile_bufs[p_idx][off1];
-                                                let m2 = y1 - y0;
-                                                prod_a = prod_a * y0;
-                                                if num_eval_points > 0 {
-                                                    let mut v_t = y0 + m2 * eval_points[0];
-                                                    prod_t_acc[0] = prod_t_acc[0] * v_t;
-                                                    for idx in 1..num_eval_points {
-                                                        v_t = v_t + m2;
-                                                        prod_t_acc[idx] = prod_t_acc[idx] * v_t;
+                                                let y = if m.is_zero() { a } else if m.is_one() { a + r } else { a + r * m };
+                                                unsafe { dst_base.add(j).write(y); }
+                                                if is_even {
+                                                    prev_even[p_idx] = y;
+                                                } else {
+                                                    let y0 = prev_even[p_idx];
+                                                    let m2 = y - y0;
+                                                    prod_a_pair = prod_a_pair * y0;
+                                                    if num_eval_points > 0 {
+                                                        let mut v_t = y0 + m2 * eval_points[0];
+                                                        prod_t_acc[0] = prod_t_acc[0] * v_t;
+                                                        for idx in 1..num_eval_points {
+                                                            v_t = v_t + m2;
+                                                            prod_t_acc[idx] = prod_t_acc[idx] * v_t;
+                                                        }
                                                     }
                                                 }
                                             }
-                                            h0_acc = h0_acc + prod_a;
-                                            for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
-                                            for v in &mut prod_t_acc { *v = F::one(); }
-                                        }
-
-                                        // Bulk copy buffers to destination arrays (fast path)
-                                        for p_idx in 0..num_polys {
-                                            let dst_base = base_addrs[p_idx] as *mut F;
-                                            // Prefetch destination lines ahead of copy
-                                            #[cfg(all(target_arch = "x86_64", feature = "tiling_prefetch"))]
-                                            unsafe {
-                                                let pf_ptr = dst_base.add(start) as *const i8;
-                                                _mm_prefetch(pf_ptr, _MM_HINT_T0);
-                                            }
-                                            unsafe {
-                                                std::ptr::copy_nonoverlapping(
-                                                    tile_bufs[p_idx].as_ptr(),
-                                                    dst_base.add(start),
-                                                    cur_len,
-                                                );
+                                            if !is_even {
+                                                h0_acc = h0_acc + prod_a_pair;
+                                                for idx in 0..num_eval_points { ht_acc[idx] = ht_acc[idx] + prod_t_acc[idx]; }
+                                                for v in &mut prod_t_acc { *v = F::one(); }
                                             }
                                         }
                                     }
-                                    (h0_acc, ht_acc, prod_t_acc, tile_bufs)
+                                    (h0_acc, ht_acc, prod_t_acc)
                                 },
                             )
                             .reduce(
-                                || {
-                                    let mut sv_zero: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
-                                    for _ in 0..num_eval_points { sv_zero.push(F::zero()); }
-                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
-                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
-                                    (F::zero(), sv_zero, sv_one, Vec::new())
-                                },
-                                |(h0_a, mut ht_a, _, _), (h0_b, ht_b, _, _)| {
+                                || (F::zero(), {
+                                        let mut sv_zero: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                        for _ in 0..num_eval_points { sv_zero.push(F::zero()); }
+                                        sv_zero
+                                    },
+                                    {
+                                        let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                        for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                        sv_one
+                                    }
+                                ),
+                                |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
                                     for i in 0..num_eval_points { ht_a[i] = ht_a[i] + ht_b[i]; }
-                                    let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
-                                    for _ in 0..num_eval_points { sv_one.push(F::one()); }
-                                    (h0_a + h0_b, ht_a, sv_one, Vec::new())
+                                    (h0_a + h0_b, ht_a, {
+                                        let mut sv_one: SmallVec<[F; 8]> = SmallVec::with_capacity(num_eval_points);
+                                        for _ in 0..num_eval_points { sv_one.push(F::one()); }
+                                        sv_one
+                                    })
                                 },
                             );
 
