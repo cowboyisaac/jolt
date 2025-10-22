@@ -36,3 +36,21 @@ pub fn unsafe_allocate_zero_vec<T: Sized + Zero>(size: usize) -> Vec<T> {
     }
     result
 }
+
+/// Allocates a zero-initialized Vec<T> with a requested alignment (in bytes).
+/// Caller must ensure `align` is a power of two and >= align_of::<T>().
+/// Falls back to align_of::<T>() if a smaller alignment is requested.
+pub fn unsafe_allocate_zero_vec_aligned<T: Sized + Zero>(size: usize, align: usize) -> Vec<T> {
+    let required_align = core::mem::align_of::<T>();
+    let use_align = if align >= required_align { align } else { required_align };
+    let bytes = size.checked_mul(core::mem::size_of::<T>()).expect("size overflow");
+
+    let result: Vec<T>;
+    unsafe {
+        let layout = std::alloc::Layout::from_size_align(bytes, use_align).expect("invalid layout");
+        let ptr = std::alloc::alloc_zeroed(layout) as *mut T;
+        if ptr.is_null() { panic!("Zero vec aligned allocation failed"); }
+        result = Vec::from_raw_parts(ptr, size, size);
+    }
+    result
+}

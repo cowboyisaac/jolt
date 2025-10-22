@@ -55,6 +55,8 @@ impl<F: JoltField> DensePolynomial<F> {
         }
     }
 
+    
+
     pub fn get_num_vars(&self) -> usize {
         self.num_vars
     }
