@@ -200,11 +200,19 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
 
                         // Parallel tiles with per-worker accumulators; per tile we first write y sequentially per polynomial,
                         // then read those y back to accumulate h(·). This preserves fused semantics and maximizes write coalescing.
-                        let (h0_total, ht_total, _worker_scratch) = (0..num_tiles)
-                            .into_par_iter()
-                            .fold(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
-                                |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
+                        
+                        // Create a vector of tile indices and use par_chunks for better memory locality
+                        // This ensures each thread gets a contiguous range of tiles to process
+                        let tile_indices: Vec<usize> = (0..num_tiles).collect();
+                        let chunk_size = std::cmp::max(1, (num_tiles + rayon::current_num_threads() - 1) / rayon::current_num_threads());
+                        
+                        let (h0_total, ht_total, _worker_scratch) = tile_indices
+                            .par_chunks(chunk_size)
+                            .map(|tile_chunk| {
+                                // Process a contiguous chunk of tiles per thread
+                                tile_chunk.iter().fold(
+                                    (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                                    |(mut h0_acc, mut ht_acc, mut prod_t_acc), &tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
                                     if start < end {
@@ -250,8 +258,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                         }
                                     }
                                     (h0_acc, ht_acc, prod_t_acc)
-                                },
-                            )
+                                })
+                            })
                             .reduce(
                                 || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
                                 |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
@@ -268,11 +276,17 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                         s.next_polys = Some(old_polys);
                     } else {
                         // No binding yet (round 0): evaluate directly from current arrays using full-size pairs
-                        let (h0_total, ht_total, _scratch_prod) = (0..num_tiles)
-                            .into_par_iter()
-                            .fold(
-                                || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
-                                |(mut h0_acc, mut ht_acc, mut prod_t_acc), tile_idx| {
+                        // Use par_chunks for better memory locality in round 0 as well
+                        let tile_indices: Vec<usize> = (0..num_tiles).collect();
+                        let chunk_size = std::cmp::max(1, (num_tiles + rayon::current_num_threads() - 1) / rayon::current_num_threads());
+                        
+                        let (h0_total, ht_total, _scratch_prod) = tile_indices
+                            .par_chunks(chunk_size)
+                            .map(|tile_chunk| {
+                                // Process a contiguous chunk of tiles per thread
+                                tile_chunk.iter().fold(
+                                    (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
+                                    |(mut h0_acc, mut ht_acc, mut prod_t_acc), &tile_idx| {
                                     let start = tile_idx * s.tile_len;
                                     let end = core::cmp::min(start + s.tile_len, half_before);
                                     for j in start..end {
@@ -296,8 +310,8 @@ impl<F: JoltField, T: Transcript> SumcheckInstance<F, T> for ProductSumcheck<F> 
                                         for v in &mut prod_t_acc { *v = F::one(); }
                                     }
                                     (h0_acc, ht_acc, prod_t_acc)
-                                },
-                            )
+                                })
+                            })
                             .reduce(
                                 || (F::zero(), vec![F::zero(); t_len], vec![F::one(); t_len]),
                                 |(h0_a, mut ht_a, _), (h0_b, ht_b, _)| {
