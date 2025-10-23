@@ -221,6 +221,8 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
     let mut rows: Vec<(u32, u32, usize, usize, f64, f64, f64, f64, usize, f64, f64, f64, f64, f64, f64)> = Vec::new();
     // (vec_len, batch_ms, tiling_ms, T, d, threads, tile_len)
     let mut repr_rounds: Option<(Vec<usize>, Vec<f64>, Vec<f64>, u32, u32, usize, usize)> = None;
+    // Collect per-round speedup series for ALL runs in this batch
+    let mut all_rounds_series: Vec<(String, Vec<i32>, Vec<f64>)> = Vec::new();
     for &thr in &thread_variants {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(thr).build().expect("build thread pool");
         pool.install(|| {
@@ -257,6 +259,27 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
                             sp_input, sp_boot, sp_recur
                         );
                         rows.push((t, d, threads_here, tile_len_opt.unwrap_or(0), gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
+                        // Build per-run speedup series for this configuration
+                        let rounds = std::cmp::min(pr_ms_b.len(), pr_ms_t.len());
+                        if rounds > 1 {
+                            let mut xs_t: Vec<i32> = Vec::new();
+                            let mut sp_vec: Vec<f64> = Vec::new();
+                            for r in 1..rounds {
+                                let len = *pr_len_b.get(r).unwrap_or(&0);
+                                if len == 0 { continue; }
+                                let t_round = (usize::BITS as usize - 1) - (len.leading_zeros() as usize);
+                                let b = pr_ms_b[r];
+                                let tl = pr_ms_t[r];
+                                if tl > 0.0 {
+                                    xs_t.push(t_round as i32);
+                                    sp_vec.push((b / tl).max(1e-3));
+                                }
+                            }
+                            if !xs_t.is_empty() {
+                                let label = format!("d={}, T={}, thr={}, tile={}", d, t, threads_here, tile_len_val);
+                                all_rounds_series.push((label, xs_t, sp_vec));
+                            }
+                        }
                         // Save representative per-round data for the largest T encountered
                         let should_set = match &repr_rounds {
                             None => true,
@@ -284,9 +307,10 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
     bench::plotting::draw_all_charts(&rows, &t_list, &d_list, &thread_variants, &out_path);
     if let Some((xs, ys_b, ys_t, t, d, thr, tile_len)) = repr_rounds {
         bench::plotting::draw_rounds_chart(&xs, &ys_b, &ys_t, t, d, thr, tile_len, &out_path);
-        bench::plotting::draw_rounds_speedup_chart(&xs, &ys_b, &ys_t, &out_path);
-        bench::plotting::draw_rounds_normalized_chart(&xs, &ys_b, &ys_t, &out_path);
         bench::plotting::draw_rounds_tail_chart(&xs, &ys_b, &ys_t, 8, &out_path);
+    }
+    if !all_rounds_series.is_empty() {
+        bench::plotting::draw_rounds_speedup_multi(&all_rounds_series, &out_path);
     }
 }
 

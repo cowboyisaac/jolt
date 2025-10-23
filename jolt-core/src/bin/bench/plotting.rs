@@ -312,4 +312,40 @@ pub fn draw_rounds_tail_chart(
     root.present().unwrap();
 }
 
+pub fn draw_rounds_speedup_multi(
+    series: &[(String, Vec<i32>, Vec<f64>)],
+    out_path: &str,
+) {
+    let out_multi = std::path::Path::new(out_path).with_file_name("bench_by_rounds_speedup.png");
+    let root = BitMapBackend::new(out_multi.to_str().unwrap(), (1280, 720)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    // Determine bounds
+    let xmin = series.iter().flat_map(|(_, xs, _)| xs.iter().copied()).min().unwrap_or(0);
+    let xmax = series.iter().flat_map(|(_, xs, _)| xs.iter().copied()).max().unwrap_or(0);
+    let floor = 1e-3f64;
+    let mut ymax = series.iter().flat_map(|(_, _, ys)| ys.iter().copied()).fold(0.0, f64::max) * 1.2;
+    if ymax < 2.0 { ymax = 2.0; }
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Per-round Speedup (all runs, log)", ("sans-serif", 24))
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d((xmin - 1)..(xmax + 1), (floor..ymax).log_scale())
+        .unwrap();
+    chart.configure_mesh().x_desc("T (vec_len = 2^T)").y_desc("speedup (log)").draw().unwrap();
+
+    // Simple color palette
+    let palette: [RGBColor; 7] = [RED, GREEN, BLUE, MAGENTA, CYAN, BLACK, YELLOW];
+    for (i, (label, xs, ys)) in series.iter().enumerate() {
+        let col = palette[i % palette.len()];
+        let style = ShapeStyle { color: col.to_rgba(), filled: false, stroke_width: 2 };
+        let pts: Vec<(i32, f64)> = xs.iter().copied().zip(ys.iter().map(|&v| v.max(floor))).collect();
+        chart.draw_series(LineSeries::new(pts, style)).unwrap()
+            .label(label.clone())
+            .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], ShapeStyle { color: col.to_rgba(), filled: false, stroke_width: 2 }));
+    }
+    chart.configure_series_labels().background_style(&WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();
+    root.present().unwrap();
+}
+
 
