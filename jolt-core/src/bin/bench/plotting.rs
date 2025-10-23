@@ -183,9 +183,10 @@ pub fn draw_rounds_chart(
     // Compute per-round speedup and clamp for log scale
     let mut points: Vec<(i32, f64)> = Vec::new();
     for i in 0..batch_ms.len() {
-        let t = if i < tiling_ms.len() { tiling_ms[i] } else { 0.0 };
+        let tval = if i < tiling_ms.len() { tiling_ms[i] } else { 0.0 };
         let b = batch_ms[i];
-        if t > 0.0 { points.push((ts.get(i).copied().unwrap_or(0), (b / t).max(1e-3))); }
+        let tt = ts.get(i).copied().unwrap_or(0);
+        if tt >= 8 && tval > 0.0 { points.push((tt, (b / tval).max(1e-3))); }
     }
     let mut ymax = points.iter().map(|p| p.1).fold(0.0, f64::max) * 1.2;
     if ymax < 2.0 { ymax = 2.0; }
@@ -215,13 +216,14 @@ pub fn draw_rounds_speedup_chart(
     let root = BitMapBackend::new(out_rounds.to_str().unwrap(), (1280, 720)).into_drawing_area();
     root.fill(&WHITE).unwrap();
     let ts: Vec<i32> = vec_lens.iter().map(|&n| if n == 0 { 0 } else { (usize::BITS as usize - 1 - n.leading_zeros() as usize) as i32 }).collect();
-    let mut sp: Vec<f64> = Vec::with_capacity(batch_ms.len());
-    for i in 0..batch_ms.len() {
-        let t = if i < tiling_ms.len() && tiling_ms[i] > 0.0 { tiling_ms[i] } else { f64::NAN };
-        let b = batch_ms[i];
-        if t.is_finite() && t > 0.0 { sp.push(b / t); } else { sp.push(f64::NAN); }
-    }
-    let points: Vec<(i32, f64)> = ts.iter().copied().zip(sp.into_iter()).filter(|(_, v)| v.is_finite() && *v > 0.0).collect();
+    let points: Vec<(i32, f64)> = (0..batch_ms.len())
+        .filter_map(|i| {
+            let tval = *tiling_ms.get(i).unwrap_or(&0.0);
+            let b = *batch_ms.get(i).unwrap_or(&0.0);
+            let tt = *ts.get(i).unwrap_or(&0);
+            if tt >= 8 && tval > 0.0 { Some((tt, b / tval)) } else { None }
+        })
+        .collect();
     let xmin = points.iter().map(|p| p.0).min().unwrap_or(0);
     let xmax = points.iter().map(|p| p.0).max().unwrap_or(0);
     let mut ymin = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
@@ -256,7 +258,7 @@ pub fn draw_rounds_normalized_chart(
     let points: Vec<(i32, f64)> = (0..ts.len()).filter_map(|i| {
         let b = *batch_ms.get(i).unwrap_or(&0.0);
         let t = *tiling_ms.get(i).unwrap_or(&0.0);
-        if t > 0.0 { Some((ts[i], (b / t).max(floor))) } else { None }
+        if ts[i] >= 8 && t > 0.0 { Some((ts[i], (b / t).max(floor))) } else { None }
     }).collect();
     let mut ymax = points.iter().map(|p| p.1).fold(0.0, f64::max) * 1.5;
     if ymax < 2.0 { ymax = 2.0; }
@@ -285,12 +287,14 @@ pub fn draw_rounds_tail_chart(
     let out_tail = std::path::Path::new(out_path).with_file_name("bench_by_rounds_tail.png");
     let root = BitMapBackend::new(out_tail.to_str().unwrap(), (1280, 720)).into_drawing_area();
     root.fill(&WHITE).unwrap();
-    let mut data: Vec<(i32, f64)> = vec_lens.iter().enumerate().map(|(i, &n)| {
+    let mut data: Vec<(i32, f64)> = vec_lens.iter().enumerate().filter_map(|(i, &n)| {
         let t = if n == 0 { 0 } else { (usize::BITS as usize - 1 - n.leading_zeros() as usize) as i32 };
         let b = *batch_ms.get(i).unwrap_or(&0.0);
         let ti = *tiling_ms.get(i).unwrap_or(&0.0);
-        let sp = if ti > 0.0 { (b / ti).max(1e-3) } else { 1e-3 };
-        (t, sp)
+        if t >= 8 && ti > 0.0 {
+            let sp = (b / ti).max(1e-3);
+            Some((t, sp))
+        } else { None }
     }).collect();
     data.sort_by_key(|(t, _)| *t);
     let take = last_n.min(data.len());
@@ -339,10 +343,12 @@ pub fn draw_rounds_speedup_multi(
     for (i, (label, xs, ys)) in series.iter().enumerate() {
         let col = palette[i % palette.len()];
         let style = ShapeStyle { color: col.to_rgba(), filled: false, stroke_width: 2 };
-        let pts: Vec<(i32, f64)> = xs.iter().copied().zip(ys.iter().map(|&v| v.max(floor))).collect();
-        chart.draw_series(LineSeries::new(pts, style)).unwrap()
-            .label(label.clone())
-            .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], ShapeStyle { color: col.to_rgba(), filled: false, stroke_width: 2 }));
+        let pts: Vec<(i32, f64)> = xs.iter().copied().zip(ys.iter().copied()).filter(|(tt, v)| *tt >= 8 && *v > 0.0).collect();
+        if !pts.is_empty() {
+            chart.draw_series(LineSeries::new(pts, style)).unwrap()
+                .label(label.clone())
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], ShapeStyle { color: col.to_rgba(), filled: false, stroke_width: 2 }));
+        }
     }
     chart.configure_series_labels().background_style(&WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();
     root.present().unwrap();
