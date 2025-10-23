@@ -163,4 +163,153 @@ pub fn draw_all_charts(
     root3.present().unwrap();
 }
 
+pub fn draw_rounds_chart(
+    vec_lens: &[usize],
+    batch_ms: &[f64],
+    tiling_ms: &[f64],
+    t: u32,
+    d: u32,
+    threads: usize,
+    tile_len: usize,
+    out_path: &str,
+) {
+    let out_rounds = std::path::Path::new(out_path).with_file_name("bench_by_rounds.png");
+    let root = BitMapBackend::new(out_rounds.to_str().unwrap(), (1280, 720)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    // X-axis as T = log2(vec_len), linear scale
+    let ts: Vec<i32> = vec_lens.iter().map(|&n| if n == 0 { 0 } else { (usize::BITS as usize - 1 - n.leading_zeros() as usize) as i32 }).collect();
+    let xmin = *ts.iter().min().unwrap_or(&0);
+    let xmax = *ts.iter().max().unwrap_or(&0);
+    // Compute per-round speedup and clamp for log scale
+    let mut points: Vec<(i32, f64)> = Vec::new();
+    for i in 0..batch_ms.len() {
+        let t = if i < tiling_ms.len() { tiling_ms[i] } else { 0.0 };
+        let b = batch_ms[i];
+        if t > 0.0 { points.push((ts.get(i).copied().unwrap_or(0), (b / t).max(1e-3))); }
+    }
+    let mut ymax = points.iter().map(|p| p.1).fold(0.0, f64::max) * 1.2;
+    if ymax < 2.0 { ymax = 2.0; }
+    let mut chart = ChartBuilder::on(&root)
+        .caption(
+            format!("Per-round Speedup (batch/tiling, log) — d={}, T={}, thr={}, tile_len={}", d, t, threads, tile_len),
+            ("sans-serif", 24)
+        )
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d((xmin - 1)..(xmax + 1), (1e-3..ymax).log_scale())
+        .unwrap();
+    chart.configure_mesh().x_desc("T (vec_len = 2^T)").y_desc("speedup (log)").draw().unwrap();
+    chart.draw_series(LineSeries::new(points, &BLACK)).unwrap().label("speedup").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
+    chart.configure_series_labels().background_style(&WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();
+    root.present().unwrap();
+}
+
+pub fn draw_rounds_speedup_chart(
+    vec_lens: &[usize],
+    batch_ms: &[f64],
+    tiling_ms: &[f64],
+    out_path: &str,
+) {
+    let out_rounds = std::path::Path::new(out_path).with_file_name("bench_by_rounds_speedup.png");
+    let root = BitMapBackend::new(out_rounds.to_str().unwrap(), (1280, 720)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    let ts: Vec<i32> = vec_lens.iter().map(|&n| if n == 0 { 0 } else { (usize::BITS as usize - 1 - n.leading_zeros() as usize) as i32 }).collect();
+    let mut sp: Vec<f64> = Vec::with_capacity(batch_ms.len());
+    for i in 0..batch_ms.len() {
+        let t = if i < tiling_ms.len() && tiling_ms[i] > 0.0 { tiling_ms[i] } else { f64::NAN };
+        let b = batch_ms[i];
+        if t.is_finite() && t > 0.0 { sp.push(b / t); } else { sp.push(f64::NAN); }
+    }
+    let points: Vec<(i32, f64)> = ts.iter().copied().zip(sp.into_iter()).filter(|(_, v)| v.is_finite() && *v > 0.0).collect();
+    let xmin = points.iter().map(|p| p.0).min().unwrap_or(0);
+    let xmax = points.iter().map(|p| p.0).max().unwrap_or(0);
+    let mut ymin = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    if !ymin.is_finite() { ymin = 0.5; }
+    ymin = ymin.min(0.9); // ensure lower bound shows slowdowns
+    let ymax = points.iter().map(|p| p.1).fold(0.0, f64::max) * 1.2;
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Per-round Speedup (batch/tiling)", ("sans-serif", 24))
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d((xmin - 1)..(xmax + 1), (ymin.max(0.5)..ymax.max(1.5)).log_scale())
+        .unwrap();
+    chart.configure_mesh().x_desc("T (vec_len = 2^T)").y_desc("speedup (log)").draw().unwrap();
+    chart.draw_series(LineSeries::new(points, &BLACK)).unwrap().label("speedup").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
+    chart.configure_series_labels().background_style(&WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();
+    root.present().unwrap();
+}
+
+pub fn draw_rounds_normalized_chart(
+    vec_lens: &[usize],
+    batch_ms: &[f64],
+    tiling_ms: &[f64],
+    out_path: &str,
+) {
+    let out_norm = std::path::Path::new(out_path).with_file_name("bench_by_rounds_norm.png");
+    let root = BitMapBackend::new(out_norm.to_str().unwrap(), (1280, 720)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    let ts: Vec<i32> = vec_lens.iter().map(|&n| if n == 0 { 0 } else { (usize::BITS as usize - 1 - n.leading_zeros() as usize) as i32 }).collect();
+    // Normalized speedup is identical to raw speedup; plot speedup with log y
+    let floor = 1e-3f64;
+    let points: Vec<(i32, f64)> = (0..ts.len()).filter_map(|i| {
+        let b = *batch_ms.get(i).unwrap_or(&0.0);
+        let t = *tiling_ms.get(i).unwrap_or(&0.0);
+        if t > 0.0 { Some((ts[i], (b / t).max(floor))) } else { None }
+    }).collect();
+    let mut ymax = points.iter().map(|p| p.1).fold(0.0, f64::max) * 1.5;
+    if ymax < 2.0 { ymax = 2.0; }
+    let xmin = *ts.iter().min().unwrap_or(&0);
+    let xmax = *ts.iter().max().unwrap_or(&0);
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Per-round Speedup (log)", ("sans-serif", 24))
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d((xmin - 1)..(xmax + 1), (floor..ymax).log_scale())
+        .unwrap();
+    chart.configure_mesh().x_desc("T (vec_len = 2^T)").y_desc("speedup (log)").draw().unwrap();
+    chart.draw_series(LineSeries::new(points, &BLACK)).unwrap().label("speedup").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
+    chart.configure_series_labels().background_style(&WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();
+    root.present().unwrap();
+}
+
+pub fn draw_rounds_tail_chart(
+    vec_lens: &[usize],
+    batch_ms: &[f64],
+    tiling_ms: &[f64],
+    last_n: usize,
+    out_path: &str,
+) {
+    let out_tail = std::path::Path::new(out_path).with_file_name("bench_by_rounds_tail.png");
+    let root = BitMapBackend::new(out_tail.to_str().unwrap(), (1280, 720)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    let mut data: Vec<(i32, f64)> = vec_lens.iter().enumerate().map(|(i, &n)| {
+        let t = if n == 0 { 0 } else { (usize::BITS as usize - 1 - n.leading_zeros() as usize) as i32 };
+        let b = *batch_ms.get(i).unwrap_or(&0.0);
+        let ti = *tiling_ms.get(i).unwrap_or(&0.0);
+        let sp = if ti > 0.0 { (b / ti).max(1e-3) } else { 1e-3 };
+        (t, sp)
+    }).collect();
+    data.sort_by_key(|(t, _)| *t);
+    let take = last_n.min(data.len());
+    let tail = &data[data.len().saturating_sub(take)..];
+    let xmin = tail.iter().map(|p| p.0).min().unwrap_or(0);
+    let xmax = tail.iter().map(|p| p.0).max().unwrap_or(0);
+    let ymax = tail.iter().map(|p| p.1).fold(0.0, f64::max) * 1.2;
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Per-round Speedup (largest rounds, log)", ("sans-serif", 24))
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d((xmin - 1)..(xmax + 1), (1e-3..ymax).log_scale())
+        .unwrap();
+    chart.configure_mesh().x_desc("T (vec_len = 2^T)").y_desc("speedup (log)").draw().unwrap();
+    let series_sp: Vec<(i32, f64)> = tail.iter().map(|(t, sp)| (*t, *sp)).collect();
+    chart.draw_series(LineSeries::new(series_sp, &BLACK)).unwrap().label("speedup").legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLACK));
+    chart.configure_series_labels().background_style(&WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();
+    root.present().unwrap();
+}
+
 

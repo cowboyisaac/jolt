@@ -219,6 +219,8 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
     let tile_len_variants: Vec<usize> = if let Some(v) = tile_lens { if v.is_empty() { vec![0usize] } else { v } } else { vec![0usize] };
     println!("Batch experiments: Ts={:?}, ds={:?}, threads={:?}, tile_lens={:?}", t_list, d_list, thread_variants, tile_len_variants);
     let mut rows: Vec<(u32, u32, usize, usize, f64, f64, f64, f64, usize, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    // (vec_len, batch_ms, tiling_ms, T, d, threads, tile_len)
+    let mut repr_rounds: Option<(Vec<usize>, Vec<f64>, Vec<f64>, u32, u32, usize, usize)> = None;
     for &thr in &thread_variants {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(thr).build().expect("build thread pool");
         pool.install(|| {
@@ -229,14 +231,14 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
                     let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
                     // Run batch once per (t,d,threads)
                     let batch_clone = polys_base.clone();
-                    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, _pr_ms_b, _pr_len_b) = timed_batch::<Fr>(batch_clone);
+                    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, pr_ms_b, pr_len_b) = timed_batch::<Fr>(batch_clone);
 
                     for &tile_len in &tile_len_variants {
                         let overall_start = Instant::now();
                         let tile_len_opt = if tile_len == 0 { None } else { Some(tile_len) };
                         // Clone per tile_len for tiling runs
                         let polys_for_tiling = polys_base.clone();
-                        let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms, _pr_ms_t, _pr_len_t) = timed_tiling_with_polys::<Fr>(polys_for_tiling, tile_len_opt);
+                        let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms, pr_ms_t, _pr_len_t) = timed_tiling_with_polys::<Fr>(polys_for_tiling, tile_len_opt);
                         let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
                         let threads_here = rayon::current_num_threads();
                         let tile_len_val = tile_len_opt.unwrap_or(0);
@@ -255,6 +257,23 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
                             sp_input, sp_boot, sp_recur
                         );
                         rows.push((t, d, threads_here, tile_len_opt.unwrap_or(0), gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
+                        // Save representative per-round data for the largest T encountered
+                        let should_set = match &repr_rounds {
+                            None => true,
+                            Some((_l, _b, _ti, t_prev, _dprev, _thprev, _tlprev)) => t > *t_prev,
+                        };
+                        if should_set {
+                            let mut xs: Vec<usize> = Vec::new();
+                            let mut ys_b: Vec<f64> = Vec::new();
+                            let mut ys_t: Vec<f64> = Vec::new();
+                            let rounds = std::cmp::min(pr_ms_b.len(), pr_ms_t.len());
+                            for r in 1..rounds {
+                                xs.push(*pr_len_b.get(r).unwrap_or(&0));
+                                ys_b.push(pr_ms_b[r]);
+                                ys_t.push(pr_ms_t[r]);
+                            }
+                            repr_rounds = Some((xs, ys_b, ys_t, t, d, threads_here, tile_len_val));
+                        }
                     }
                 }
             }
@@ -263,6 +282,12 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
 
     // Draw charts using the plotting module
     bench::plotting::draw_all_charts(&rows, &t_list, &d_list, &thread_variants, &out_path);
+    if let Some((xs, ys_b, ys_t, t, d, thr, tile_len)) = repr_rounds {
+        bench::plotting::draw_rounds_chart(&xs, &ys_b, &ys_t, t, d, thr, tile_len, &out_path);
+        bench::plotting::draw_rounds_speedup_chart(&xs, &ys_b, &ys_t, &out_path);
+        bench::plotting::draw_rounds_normalized_chart(&xs, &ys_b, &ys_t, &out_path);
+        bench::plotting::draw_rounds_tail_chart(&xs, &ys_b, &ys_t, 8, &out_path);
+    }
 }
 
 // ------------ Helpers moved from impl -------------
