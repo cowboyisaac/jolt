@@ -186,7 +186,7 @@ pub fn draw_rounds_chart(
         let tval = if i < tiling_ms.len() { tiling_ms[i] } else { 0.0 };
         let b = batch_ms[i];
         let tt = ts.get(i).copied().unwrap_or(0);
-        if tt >= 8 && tval > 0.0 { points.push((tt, (b / tval).max(1e-3))); }
+        if tt >= 5 && tval > 0.0 { points.push((tt, (b / tval).max(1e-3))); }
     }
     let mut ymax = points.iter().map(|p| p.1).fold(0.0, f64::max) * 1.2;
     if ymax < 2.0 { ymax = 2.0; }
