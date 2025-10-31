@@ -12,13 +12,13 @@ pub fn draw_all_charts(
     // Chart 1: by trace size (T) — plot throughput instead of time
     let root = BitMapBackend::new(out_path, (1280, 720)).into_drawing_area();
     root.fill(&WHITE).unwrap();
-    // Compute y max from throughput across all series
+    // Compute y max from throughput (M elems/s) across all series
     let y_max = rows
         .iter()
         .map(|r| {
             let total_elems = ((1usize << r.0) as f64) * (r.1 as f64);
-            let to_tp = |ms: f64| if ms > 0.0 { total_elems * 1000.0 / ms } else { 0.0 };
-            to_tp(r.9).max(to_tp(r.10)).max(to_tp(r.11)).max(to_tp(r.12))
+            let to_tp_m = |ms: f64| if ms > 0.0 { (total_elems * 1000.0 / ms) / 1e6 } else { 0.0 };
+            to_tp_m(r.9).max(to_tp_m(r.10)).max(to_tp_m(r.11)).max(to_tp_m(r.12))
         })
         .fold(0.0, f64::max)
         * 1.2;
@@ -26,7 +26,7 @@ pub fn draw_all_charts(
     let t_max = *t_list.iter().max().unwrap_or(&0) as i32;
     let mut chart = ChartBuilder::on(&root)
         .caption(
-            format!("Sumcheck Proving Throughput (elems/s) — threads={:?}", thread_variants),
+            format!("Sumcheck Proving Throughput (M elems/s) — threads={:?}", thread_variants),
             ("sans-serif", 24)
         )
         .margin(20)
@@ -34,7 +34,7 @@ pub fn draw_all_charts(
         .y_label_area_size(60)
         .build_cartesian_2d((t_min - 1)..(t_max + 1), 0f64..y_max)
         .unwrap();
-    chart.configure_mesh().x_desc("T").y_desc("Throughput (elems/s)").draw().unwrap();
+    chart.configure_mesh().x_desc("T").y_desc("Throughput (M elems/s)").draw().unwrap();
 
     for &d in d_list {
         for &thr in thread_variants {
@@ -45,11 +45,11 @@ pub fn draw_all_charts(
             for &(t, dd, threads_here, _tile_len, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct, _ibatch, _itiling) in rows.iter() {
                 if dd == d && threads_here == thr {
                     let total_elems = ((1usize << t) as f64) * (dd as f64);
-                    let to_tp = |ms: f64| if ms > 0.0 { total_elems * 1000.0 / ms } else { 0.0 };
-                    series_batch_first.push((t as i32, to_tp(ib)));
-                    series_batch_prove.push((t as i32, to_tp(cb)));
-                    series_tiling_first.push((t as i32, to_tp(it)));
-                    series_tiling_prove.push((t as i32, to_tp(ct)));
+                    let to_tp_m = |ms: f64| if ms > 0.0 { (total_elems * 1000.0 / ms) / 1e6 } else { 0.0 };
+                    series_batch_first.push((t as i32, to_tp_m(ib)));
+                    series_batch_prove.push((t as i32, to_tp_m(cb)));
+                    series_tiling_first.push((t as i32, to_tp_m(it)));
+                    series_tiling_prove.push((t as i32, to_tp_m(ct)));
                 }
             }
             chart
@@ -92,14 +92,14 @@ pub fn draw_all_charts(
         .iter()
         .map(|r| {
             let total_elems = ((1usize << r.0) as f64) * (r.1 as f64);
-            let to_tp = |ms: f64| if ms > 0.0 { total_elems * 1000.0 / ms } else { 0.0 };
-            to_tp(r.9).max(to_tp(r.10)).max(to_tp(r.11)).max(to_tp(r.12))
+            let to_tp_m = |ms: f64| if ms > 0.0 { (total_elems * 1000.0 / ms) / 1e6 } else { 0.0 };
+            to_tp_m(r.9).max(to_tp_m(r.10)).max(to_tp_m(r.11)).max(to_tp_m(r.12))
         })
         .fold(0.0, f64::max)
         * 1.2;
     let mut chart2 = ChartBuilder::on(&root2)
         .caption(
-            format!("Sumcheck Proving Throughput (elems/s) — by threads, Ts={:?}", t_list),
+            format!("Sumcheck Proving Throughput (M elems/s) — by threads, Ts={:?}", t_list),
             ("sans-serif", 24)
         )
         .margin(20)
@@ -107,7 +107,7 @@ pub fn draw_all_charts(
         .y_label_area_size(60)
         .build_cartesian_2d((threads_min - 1)..(threads_max + 1), 0f64..y2_max)
         .unwrap();
-    chart2.configure_mesh().x_desc("threads").y_desc("Throughput (elems/s)").draw().unwrap();
+    chart2.configure_mesh().x_desc("threads").y_desc("Throughput (M elems/s)").draw().unwrap();
 
     for &d in d_list {
         for &t in t_list {
@@ -118,11 +118,11 @@ pub fn draw_all_charts(
             for &(tt, dd, threads_here, _tile_len, _gen, _pb, _pt, _tot, _thr_dup, ib, cb, it, ct, _ibatch, _itiling) in rows.iter() {
                 if dd == d && tt == t {
                     let total_elems = ((1usize << tt) as f64) * (dd as f64);
-                    let to_tp = |ms: f64| if ms > 0.0 { total_elems * 1000.0 / ms } else { 0.0 };
-                    b_first.push((threads_here as i32, to_tp(ib)));
-                    b_prove.push((threads_here as i32, to_tp(cb)));
-                    t_first.push((threads_here as i32, to_tp(it)));
-                    t_prove.push((threads_here as i32, to_tp(ct)));
+                    let to_tp_m = |ms: f64| if ms > 0.0 { (total_elems * 1000.0 / ms) / 1e6 } else { 0.0 };
+                    b_first.push((threads_here as i32, to_tp_m(ib)));
+                    b_prove.push((threads_here as i32, to_tp_m(cb)));
+                    t_first.push((threads_here as i32, to_tp_m(it)));
+                    t_prove.push((threads_here as i32, to_tp_m(ct)));
                 }
             }
             chart2.draw_series(LineSeries::new(b_first, &RED)).unwrap()
@@ -159,19 +159,19 @@ pub fn draw_all_charts(
         .iter()
         .map(|r| {
             let total_elems = ((1usize << r.0) as f64) * (r.1 as f64);
-            let to_tp = |ms: f64| if ms > 0.0 { total_elems * 1000.0 / ms } else { 0.0 };
-            to_tp(r.11).max(to_tp(r.12))
+            let to_tp_m = |ms: f64| if ms > 0.0 { (total_elems * 1000.0 / ms) / 1e6 } else { 0.0 };
+            to_tp_m(r.11).max(to_tp_m(r.12))
         })
         .fold(0.0, f64::max)
         * 1.2;
     let mut chart3 = ChartBuilder::on(&root3)
-        .caption("Sumcheck Proving Throughput (elems/s) — by tile_len", ("sans-serif", 24))
+        .caption("Sumcheck Proving Throughput (M elems/s) — by tile_len", ("sans-serif", 24))
         .margin(20)
         .x_label_area_size(40)
         .y_label_area_size(60)
         .build_cartesian_2d((tile_min - 1)..(tile_max + 1), 0f64..y3_max)
         .unwrap();
-    chart3.configure_mesh().x_desc("tile_len").y_desc("Throughput (elems/s)").draw().unwrap();
+    chart3.configure_mesh().x_desc("tile_len").y_desc("Throughput (M elems/s)").draw().unwrap();
     for &d in d_list {
         for &thr in thread_variants {
             let mut t_first: Vec<(i32, f64)> = Vec::new();
@@ -179,9 +179,9 @@ pub fn draw_all_charts(
             for &(_t, dd, threads_here, tile_len, _gen, _pb, _pt, _tot, _thr_dup, _ib, _cb, it, ct, _ibatch, _itiling) in rows.iter() {
                 if dd == d && threads_here == thr && tile_len != 0 {
                     let total_elems = ((1usize << _t) as f64) * (dd as f64);
-                    let to_tp = |ms: f64| if ms > 0.0 { total_elems * 1000.0 / ms } else { 0.0 };
-                    t_first.push((tile_len as i32, to_tp(it)));
-                    t_prove.push((tile_len as i32, to_tp(ct)));
+                    let to_tp_m = |ms: f64| if ms > 0.0 { (total_elems * 1000.0 / ms) / 1e6 } else { 0.0 };
+                    t_first.push((tile_len as i32, to_tp_m(it)));
+                    t_prove.push((tile_len as i32, to_tp_m(ct)));
                 }
             }
             chart3.draw_series(LineSeries::new(t_first, &BLUE)).unwrap().label(format!("tiling boot-kernel throughput d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
