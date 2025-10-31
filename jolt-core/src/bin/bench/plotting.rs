@@ -52,26 +52,47 @@ pub fn draw_all_charts(
                     series_tiling_prove.push((t as i32, to_tp_m(ct)));
                 }
             }
+            let style_red = ShapeStyle { color: RED.to_rgba(), filled: false, stroke_width: 2 };
+            let style_green = ShapeStyle { color: GREEN.to_rgba(), filled: false, stroke_width: 2 };
+            let style_blue = ShapeStyle { color: BLUE.to_rgba(), filled: false, stroke_width: 2 };
+            let style_magenta = ShapeStyle { color: MAGENTA.to_rgba(), filled: false, stroke_width: 2 };
+
             chart
-                .draw_series(LineSeries::new(series_batch_first, &RED))
+                .draw_series(LineSeries::new(series_batch_first.clone(), style_red))
                 .unwrap()
                 .label(format!("batch boot-kernel throughput d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: RED.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart.draw_series(series_batch_first.into_iter().map(|(x,y)| Circle::new((x,y), 3, RED.filled()))).unwrap();
             chart
-                .draw_series(LineSeries::new(series_batch_prove, &GREEN))
+                .draw_series(LineSeries::new(series_batch_prove.clone(), style_green))
                 .unwrap()
                 .label(format!("batch recursive-kernel throughput d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: GREEN.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart.draw_series(series_batch_prove.into_iter().map(|(x,y)| Circle::new((x,y), 3, GREEN.filled()))).unwrap();
             chart
-                .draw_series(LineSeries::new(series_tiling_first, &BLUE))
+                .draw_series(LineSeries::new(series_tiling_first.clone(), style_blue))
                 .unwrap()
                 .label(format!("tiling boot-kernel throughput d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: BLUE.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart.draw_series(series_tiling_first.into_iter().map(|(x,y)| Circle::new((x,y), 3, BLUE.filled()))).unwrap();
             chart
-                .draw_series(LineSeries::new(series_tiling_prove, &MAGENTA))
+                .draw_series(LineSeries::new(series_tiling_prove.clone(), style_magenta))
                 .unwrap()
                 .label(format!("tiling recursive-kernel throughput d={} thr={}", d, thr))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: MAGENTA.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart.draw_series(series_tiling_prove.into_iter().map(|(x,y)| Circle::new((x,y), 3, MAGENTA.filled()))).unwrap();
         }
     }
     chart
@@ -125,18 +146,39 @@ pub fn draw_all_charts(
                     t_prove.push((threads_here as i32, to_tp_m(ct)));
                 }
             }
-            chart2.draw_series(LineSeries::new(b_first, &RED)).unwrap()
+            let style_red = ShapeStyle { color: RED.to_rgba(), filled: false, stroke_width: 2 };
+            let style_green = ShapeStyle { color: GREEN.to_rgba(), filled: false, stroke_width: 2 };
+            let style_blue = ShapeStyle { color: BLUE.to_rgba(), filled: false, stroke_width: 2 };
+            let style_magenta = ShapeStyle { color: MAGENTA.to_rgba(), filled: false, stroke_width: 2 };
+
+            chart2.draw_series(LineSeries::new(b_first.clone(), style_red)).unwrap()
                 .label(format!("batch boot-kernel throughput d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
-            chart2.draw_series(LineSeries::new(b_prove, &GREEN)).unwrap()
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: RED.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart2.draw_series(b_first.into_iter().map(|(x,y)| Circle::new((x,y), 3, RED.filled()))).unwrap();
+            chart2.draw_series(LineSeries::new(b_prove.clone(), style_green)).unwrap()
                 .label(format!("batch recursive-kernel throughput d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &GREEN));
-            chart2.draw_series(LineSeries::new(t_first, &BLUE)).unwrap()
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: GREEN.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart2.draw_series(b_prove.into_iter().map(|(x,y)| Circle::new((x,y), 3, GREEN.filled()))).unwrap();
+            chart2.draw_series(LineSeries::new(t_first.clone(), style_blue)).unwrap()
                 .label(format!("tiling boot-kernel throughput d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
-            chart2.draw_series(LineSeries::new(t_prove, &MAGENTA)).unwrap()
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: BLUE.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart2.draw_series(t_first.into_iter().map(|(x,y)| Circle::new((x,y), 3, BLUE.filled()))).unwrap();
+            chart2.draw_series(LineSeries::new(t_prove.clone(), style_magenta)).unwrap()
                 .label(format!("tiling recursive-kernel throughput d={} T={}", d, t))
-                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
+                .legend(|(x, y)| PathElement::new(
+                    vec![(x, y), (x + 20, y)],
+                    ShapeStyle { color: MAGENTA.to_rgba(), filled: false, stroke_width: 2 }
+                ));
+            chart2.draw_series(t_prove.into_iter().map(|(x,y)| Circle::new((x,y), 3, MAGENTA.filled()))).unwrap();
         }
     }
     chart2
@@ -184,8 +226,18 @@ pub fn draw_all_charts(
                     t_prove.push((tile_len as i32, to_tp_m(ct)));
                 }
             }
-            chart3.draw_series(LineSeries::new(t_first, &BLUE)).unwrap().label(format!("tiling boot-kernel throughput d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
-            chart3.draw_series(LineSeries::new(t_prove, &MAGENTA)).unwrap().label(format!("tiling recursive-kernel throughput d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &MAGENTA));
+            let style_blue = ShapeStyle { color: BLUE.to_rgba(), filled: false, stroke_width: 2 };
+            let style_magenta = ShapeStyle { color: MAGENTA.to_rgba(), filled: false, stroke_width: 2 };
+            chart3.draw_series(LineSeries::new(t_first.clone(), style_blue)).unwrap().label(format!("tiling boot-kernel throughput d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(
+                vec![(x, y), (x + 20, y)],
+                ShapeStyle { color: BLUE.to_rgba(), filled: false, stroke_width: 2 }
+            ));
+            chart3.draw_series(t_first.into_iter().map(|(x,y)| Circle::new((x,y), 3, BLUE.filled()))).unwrap();
+            chart3.draw_series(LineSeries::new(t_prove.clone(), style_magenta)).unwrap().label(format!("tiling recursive-kernel throughput d={} thr={}", d, thr)).legend(|(x, y)| PathElement::new(
+                vec![(x, y), (x + 20, y)],
+                ShapeStyle { color: MAGENTA.to_rgba(), filled: false, stroke_width: 2 }
+            ));
+            chart3.draw_series(t_prove.into_iter().map(|(x,y)| Circle::new((x,y), 3, MAGENTA.filled()))).unwrap();
         }
     }
     chart3.configure_series_labels().background_style(&WHITE.mix(0.8)).border_style(&BLACK).draw().unwrap();

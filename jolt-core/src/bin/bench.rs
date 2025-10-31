@@ -114,8 +114,8 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, tile_len: Option<usize>) {
     let total_start = Instant::now();
     let gen_start = Instant::now();
     let polys = build_random_dense_polys::<Fr>(t, d, "fun");
-    let gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
-    let (claim, total_proving_ms, boot_ms, recur_ms, input_ms, _pr_ms, _pr_len) = match mode {
+    let _gen_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+    let (claim, _total_proving_ms, boot_ms, recur_ms, _input_ms, _pr_ms, _pr_len) = match mode {
         0 => timed_batch::<Fr>(polys),
         1 => timed_tiling_with_polys::<Fr>(polys, tile_len),
         _ => {
@@ -123,18 +123,17 @@ fn run_single_experiment(t: u32, d: u32, mode: u32, tile_len: Option<usize>) {
             timed_batch::<Fr>(build_random_dense_polys::<Fr>(t, d, "fun"))
         }
     };
-    let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+    let _total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
     let threads = rayon::current_num_threads();
     let total_elems = (1u128 << t) * (d as u128);
-    let per_thread_speed = total_elems as f64 / threads as f64;
-    let throughput = if total_proving_ms > 0.0 {
-        per_thread_speed / (total_proving_ms / 1000.0)
-    } else {
-        0.0
-    };
+    let per_thread_elems = total_elems as f64 / threads as f64;
+    let compute_ms = boot_ms + recur_ms; // exclude input-claim from throughput
+    let throughput_per_thread = if compute_ms > 0.0 {
+        per_thread_elems / (compute_ms / 1000.0)
+    } else { 0.0 };
     println!(
-        "Completed: total={:.2}ms, gen={:.2}ms, input_claim={:.2}ms, boot-kernel={:.2}ms, recursive-kernel={:.2}ms, total_proving={:.2}ms, threads={}, per_thread_speed={:.0} elems, throughput_per_thread={:.2} elems/s, output={}",
-        total_ms, gen_ms, input_ms, boot_ms, recur_ms, total_proving_ms, threads, per_thread_speed, throughput, claim
+        "Completed: throughput_per_thread={:.2} elems/s | threads={} | output={}",
+        throughput_per_thread, threads, claim
     );
 }
 
@@ -149,53 +148,29 @@ fn compare_implementations(t: u32, d: u32, tile_len: Option<usize>) -> Result<()
     let polys_clone = polys.clone();
     let clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
 
-    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, input_batch_ms, per_round_batch_ms, per_round_batch_len) = timed_batch::<Fr>(polys_clone);
-    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, input_tiling_ms, per_round_tiling_ms, _per_round_tiling_len) = timed_tiling_with_polys::<Fr>(polys, tile_len);
+    let (claim_batch, t_batch, boot_batch_ms, recur_batch_ms, _input_batch_ms, per_round_batch_ms, per_round_batch_len) = timed_batch::<Fr>(polys_clone);
+    let (claim_tiling, t_tiling, boot_tiling_ms, recur_tiling_ms, _input_tiling_ms, per_round_tiling_ms, _per_round_tiling_len) = timed_tiling_with_polys::<Fr>(polys, tile_len);
 
     let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
     let accounted = gen_ms + clone_ms + t_batch + t_tiling;
-    let overhead_ms = (overall_ms - accounted).max(0.0);
+    let _overhead_ms = (overall_ms - accounted).max(0.0);
 
     let threads = rayon::current_num_threads();
     let total_elems = (1u128 << t) * (d as u128);
 
     println!("Threads Used: {}", threads);
-    println!("Results:");
-    println!(
-        "  Batch:  input-eval={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | claim={} | equal={}",
-        input_batch_ms, boot_batch_ms, recur_batch_ms, claim_batch, claim_batch == claim_tiling
-    );
-    println!(
-        "  Tiling{}: input-eval={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms",
-        tile_len.map(|v| format!(" (tile_len={})", v)).unwrap_or_default(),
-        input_tiling_ms, boot_tiling_ms, recur_tiling_ms,
-    );
-    let sp_input = if input_tiling_ms > 0.0 { input_batch_ms / input_tiling_ms } else { 0.0 };
-    let sp_boot = if boot_tiling_ms > 0.0 { boot_batch_ms / boot_tiling_ms } else { 0.0 };
-    let sp_recur = if recur_tiling_ms > 0.0 { recur_batch_ms / recur_tiling_ms } else { 0.0 };
-    println!("  Speedup (batch/tiling): input={:.2}x | boot={:.2}x | recur={:.2}x", sp_input, sp_boot, sp_recur);
-    println!(
-        "  Time breakdown: gen={:.2}ms | clone={:.2}ms | overhead={:.2}ms",
-        gen_ms, clone_ms, overhead_ms
-    );
     let total_batch_ms = boot_batch_ms + recur_batch_ms;
     let total_tiling_ms = boot_tiling_ms + recur_tiling_ms;
-    let throughput_batch = if total_batch_ms > 0.0 {
-        total_elems as f64 / threads as f64 / (total_batch_ms / 1000.0)
-    } else {
-        0.0
-    };
-    let throughput_tiling = if total_tiling_ms > 0.0 {
-        total_elems as f64 / threads as f64 / (total_tiling_ms / 1000.0)
-    } else {
-        0.0
-    };
+    let throughput_batch = if total_batch_ms > 0.0 { total_elems as f64 / threads as f64 / (total_batch_ms / 1000.0) } else { 0.0 };
+    let throughput_tiling = if total_tiling_ms > 0.0 { total_elems as f64 / threads as f64 / (total_tiling_ms / 1000.0) } else { 0.0 };
     println!(
-        "  Throughput per thread: batch={:.2} elems/s | tiling={:.2} elems/s",
-        throughput_batch, throughput_tiling
+        "Results (per-thread throughput):\n  Batch:  {:.2} elems/s | claim={} | equal={}\n  Tiling{}: {:.2} elems/s",
+        throughput_batch, claim_batch, claim_batch == claim_tiling,
+        tile_len.map(|v| format!(" (tile_len={})", v)).unwrap_or_default(),
+        throughput_tiling
     );
-    let speedup = if t_tiling > 0.0 { t_batch / t_tiling } else { 0.0 };
-    println!("  Speedup (Batch/Tiling): {:.2}x", speedup);
+    let sp_tp = if throughput_batch > 0.0 { throughput_tiling / throughput_batch } else { 0.0 };
+    println!("  Throughput speedup (tiling/batch): {:.2}x", sp_tp);
     // Per-round breakdown printed only in compare
     let rounds = std::cmp::min(per_round_batch_ms.len(), per_round_tiling_ms.len());
     if rounds > 0 {
@@ -244,20 +219,20 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
                         let overall_ms = overall_start.elapsed().as_secs_f64() * 1000.0;
                         let threads_here = rayon::current_num_threads();
                         let tile_len_val = tile_len_opt.unwrap_or(0);
+                        let total_batch_ms = boot_batch_ms + recur_batch_ms;
+                        let total_tiling_ms = boot_tiling_ms + recur_tiling_ms;
+                        let total_elems = (1u128 << t) * (d as u128);
+                        let per_thread = total_elems as f64 / threads_here as f64;
+                        let tp_batch = if total_batch_ms > 0.0 { per_thread / (total_batch_ms / 1000.0) } else { 0.0 };
+                        let tp_tiling = if total_tiling_ms > 0.0 { per_thread / (total_tiling_ms / 1000.0) } else { 0.0 };
                         println!(
-                        "T={}, d={}, threads={}, tile_len={}\n  Batch:  input-claim={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms | equal={}\n  Tiling: input-claim={:.2}ms | boot-kernel={:.2}ms | recursive-kernel={:.2}ms",
+                        "T={}, d={}, threads={}, tile_len={}\n  Batch throughput: {:.2} elems/s | equal={}\n  Tiling throughput: {:.2} elems/s",
                         t, d, threads_here, tile_len_val,
-                        input_batch_ms, boot_batch_ms, recur_batch_ms, claim_batch == claim_tiling,
-                        input_tiling_ms, boot_tiling_ms, recur_tiling_ms
+                        tp_batch, claim_batch == claim_tiling,
+                        tp_tiling
                         );
-                        // Per-phase speedups (batch / tiling)
-                        let sp_input = if input_tiling_ms > 0.0 { input_batch_ms / input_tiling_ms } else { 0.0 };
-                        let sp_boot = if boot_tiling_ms > 0.0 { boot_batch_ms / boot_tiling_ms } else { 0.0 };
-                        let sp_recur = if recur_tiling_ms > 0.0 { recur_batch_ms / recur_tiling_ms } else { 0.0 };
-                        println!(
-                            "  Speedup (batch/tiling): input={:.2}x | boot={:.2}x | recur={:.2}x",
-                            sp_input, sp_boot, sp_recur
-                        );
+                        let sp_tp = if tp_batch > 0.0 { tp_tiling / tp_batch } else { 0.0 };
+                        println!("  Throughput speedup (tiling/batch): {:.2}x", sp_tp);
                         rows.push((t, d, threads_here, tile_len_opt.unwrap_or(0), gen_ms, t_batch, t_tiling, overall_ms, threads_here, boot_batch_ms, recur_batch_ms, boot_tiling_ms, recur_tiling_ms, input_batch_ms, input_tiling_ms));
                         // Build per-run speedup series for this configuration
                         let rounds = std::cmp::min(pr_ms_b.len(), pr_ms_t.len());
@@ -304,7 +279,7 @@ fn run_batch_experiments(t_list: Vec<u32>, d_list: Vec<u32>, out_path: String, t
     }
 
     // Draw charts using the plotting module
-    bench::plotting::draw_all_charts(&rows, &t_list, &d_list, &thread_variants, &out_path);
+        bench::plotting::draw_all_charts(&rows, &t_list, &d_list, &thread_variants, &out_path);
     if let Some((xs, ys_b, ys_t, t, d, thr, tile_len)) = repr_rounds {
         bench::plotting::draw_rounds_chart(&xs, &ys_b, &ys_t, t, d, thr, tile_len, &out_path);
         bench::plotting::draw_rounds_tail_chart(&xs, &ys_b, &ys_t, 8, &out_path);
